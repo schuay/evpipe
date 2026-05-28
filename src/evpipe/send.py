@@ -485,10 +485,14 @@ def main() -> int:
                         metavar="K1,K2,...,TRIGGER",
                         help="comma- or plus-separated evdev key names. The "
                              "last key is the trigger; the rest must be held "
-                             "when it presses. The trigger event is consumed "
-                             "(never forwarded). Pass an empty string to "
-                             "disable toggling entirely. Default: "
-                             + ",".join(DEFAULT_TOGGLE_CHORD)
+                             "when it presses. Modifier names are literal -- "
+                             "KEY_LEFTCTRL only matches the left ctrl key. "
+                             "The trigger event is consumed (never forwarded). "
+                             "Pass an empty string to disable toggling entirely. "
+                             "Examples: KEY_F10 (default), "
+                             "KEY_LEFTCTRL+KEY_F12, "
+                             "KEY_LEFTCTRL,KEY_LEFTALT,KEY_T. "
+                             "Default: " + ",".join(DEFAULT_TOGGLE_CHORD)
                              + ". Run with --log-level=DEBUG to see which "
                              "modifiers were missing when a chord fails to fire.")
     parser.add_argument("--resync-interval", type=float,
