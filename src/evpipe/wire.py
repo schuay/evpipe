@@ -1,9 +1,8 @@
 """evpipe wire format: encode/decode for the byte stream over stdin/stdout.
 
-Layout follows ``~/k/42-evpipe/design.md``. All multi-byte fields are
-little-endian and fixed-width. The session opens with a magic + version +
-device descriptor list; every subsequent packet is length-prefixed and
-discriminated by a 1-byte kind tag.
+All multi-byte fields are little-endian and fixed-width. The session
+opens with a magic + version + device-descriptor list; every subsequent
+packet is length-prefixed (u16) and discriminated by a 1-byte kind tag.
 
 Two surfaces are exposed:
   * stream functions (``write_session_open``, ``write_event``, ...,
