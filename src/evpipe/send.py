@@ -238,6 +238,7 @@ class SenderApp:
             self._write_bytes(data)
 
     async def _emit_full_state(self, src: Source) -> None:
+        """Resync: kernel-sampled ground truth. Used by the resync timer."""
         # While grabbed, sample the kernel's view of held keys for ground
         # truth -- our `held` set can drift across SYN_DROPPED etc.
         held_hid = set(src.held)
@@ -252,9 +253,22 @@ class SenderApp:
                 src.held = set(held_hid)
             except OSError:
                 pass
+        await self._send_full_state_packet(src.device_id, sorted(held_hid))
+
+    async def _emit_empty_full_state(self, src: Source) -> None:
+        """Toggle ON->OFF: force the receiver to release everything.
+
+        Crucially does *not* resample active_keys -- the user's finger may
+        still be on the trigger when this fires, and we don't want that
+        leaking onto A and getting stuck once we ungrab.
+        """
+        src.held.clear()
+        await self._send_full_state_packet(src.device_id, [])
+
+    async def _send_full_state_packet(self, device_id: int, held: list[int]) -> None:
         data = wire.encode_packet(
             wire.PACKET_FULL_STATE,
-            wire.encode_full_state(src.device_id, sorted(held_hid)),
+            wire.encode_full_state(device_id, held),
         )
         async with self._write_lock:
             self._write_bytes(data)
@@ -332,13 +346,14 @@ class SenderApp:
         self._toggle_pending = True
         try:
             if self.forwarding_on:
-                # ON -> OFF. Drop the held set and emit an empty FULL_STATE
-                # so the receiver releases anything outstanding before we
-                # ungrab. The user's actual key releases that follow happen
-                # locally on B; the receiver never sees them.
+                # ON -> OFF. Force an empty FULL_STATE so the receiver
+                # releases everything before we ungrab. Importantly we do
+                # NOT resample active_keys here -- the trigger key is
+                # being held right now, and shipping it would leave A's
+                # uinput stuck on it once we ungrab and stop forwarding
+                # the eventual release.
                 for src in self.sources:
-                    src.held.clear()
-                    await self._emit_full_state(src)
+                    await self._emit_empty_full_state(src)
                 self._ungrab_all()
                 self.forwarding_on = False
                 logger.info("forwarding OFF")

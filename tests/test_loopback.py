@@ -18,7 +18,7 @@ import evdev
 import evdev.ecodes as e
 import pytest
 
-from evpipe import wire
+from evpipe import hid_map, wire
 from evpipe.recv import ReceiverApp
 from evpipe.send import SenderApp
 
@@ -374,6 +374,76 @@ async def _chord_toggle() -> None:
                 pass
     src_kb.close()
     recv_kb.close()
+    sender_out.close()
+
+
+def test_chord_off_does_not_strand_trigger_on_receiver():
+    """ON->OFF must release the still-held trigger on the receiver side,
+    not leak it via active_keys-based resync that would leave A repeating."""
+    asyncio.run(_chord_off_clears_trigger())
+
+
+async def _chord_off_clears_trigger() -> None:
+    src_kb = evdev.UInput(
+        {e.EV_KEY: [e.KEY_A, e.KEY_F10]},
+        name="evpipe-test-stuck-src",
+        vendor=0xCAFE, product=0xBAB7,
+    )
+    await asyncio.sleep(0.2)
+
+    rfd, wfd = os.pipe()
+    sender_out = os.fdopen(wfd, "wb", buffering=0)
+    recv_in = os.fdopen(rfd, "rb", buffering=0)
+    loop = asyncio.get_running_loop()
+    reader = asyncio.StreamReader()
+    proto = asyncio.StreamReaderProtocol(reader)
+    await loop.connect_read_pipe(lambda: proto, recv_in)
+
+    sender = SenderApp(
+        [(src_kb.device.path, wire.DEV_KB)],
+        toggle_chord_evdev=[e.KEY_F10],
+        stdout=sender_out,
+        resync_interval_s=5.0,
+        start_forwarding=True,
+    )
+    receiver = ReceiverApp()
+    sender_task = asyncio.create_task(sender.run())
+    receiver_task = asyncio.create_task(receiver.run(reader))
+
+    for _ in range(40):
+        if receiver.uinputs:
+            break
+        await asyncio.sleep(0.05)
+    assert receiver.uinputs
+
+    # Simulate a hold-then-release pattern with the trigger still held at
+    # the moment ON->OFF runs (which is what the real-world bug needs).
+    src_kb.write(e.EV_KEY, e.KEY_F10, 1); src_kb.syn()
+    await asyncio.sleep(0.2)
+    assert sender.forwarding_on is False, "chord should have flipped to OFF"
+
+    # The receiver must not be tracking the trigger key as held; otherwise
+    # F10 sits down forever on A and autorepeats.
+    f10_hid = (hid_map.HID_PAGE_KEYBOARD << 8) | 0x43  # KEY_F10 -> 0x43
+    assert f10_hid not in receiver.held_per_dev[0], (
+        f"trigger key stuck on receiver: {receiver.held_per_dev[0]}"
+    )
+
+    src_kb.write(e.EV_KEY, e.KEY_F10, 0); src_kb.syn()
+    await asyncio.sleep(0.1)
+
+    sender.shutdown()
+    receiver.shutdown()
+    for t in (sender_task, receiver_task):
+        try:
+            await asyncio.wait_for(t, timeout=1.0)
+        except (asyncio.TimeoutError, Exception):
+            t.cancel()
+            try:
+                await t
+            except (asyncio.CancelledError, Exception):
+                pass
+    src_kb.close()
     sender_out.close()
 
 
