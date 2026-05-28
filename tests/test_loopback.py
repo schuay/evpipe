@@ -447,6 +447,86 @@ async def _chord_off_clears_trigger() -> None:
     sender_out.close()
 
 
+def test_chord_off_delays_ungrab_until_trigger_released():
+    """ON->OFF must keep the grab until the trigger key is physically released.
+
+    The kernel synthesises a press event to the compositor for every key that
+    is still held at ungrab time.  Releasing the grab while the trigger finger
+    is still down causes a stuck key on B.  We delay _ungrab_all() until the
+    trigger's key-up event arrives."""
+    asyncio.run(_chord_off_delays_ungrab())
+
+
+async def _chord_off_delays_ungrab() -> None:
+    src_kb = evdev.UInput(
+        {e.EV_KEY: [e.KEY_A, e.KEY_F10]},
+        name="evpipe-test-delayed-ungrab",
+        vendor=0xCAFE, product=0xBAB8,
+    )
+    await asyncio.sleep(0.2)
+
+    rfd, wfd = os.pipe()
+    sender_out = os.fdopen(wfd, "wb", buffering=0)
+    recv_in = os.fdopen(rfd, "rb", buffering=0)
+    loop = asyncio.get_running_loop()
+    reader = asyncio.StreamReader()
+    proto = asyncio.StreamReaderProtocol(reader)
+    await loop.connect_read_pipe(lambda: proto, recv_in)
+
+    sender = SenderApp(
+        [(src_kb.device.path, wire.DEV_KB)],
+        toggle_chord_evdev=[e.KEY_F10],
+        stdout=sender_out,
+        resync_interval_s=5.0,
+        start_forwarding=True,
+    )
+    receiver = ReceiverApp()
+    sender_task = asyncio.create_task(sender.run())
+    receiver_task = asyncio.create_task(receiver.run(reader))
+
+    for _ in range(40):
+        if receiver.uinputs:
+            break
+        await asyncio.sleep(0.05)
+    assert receiver.uinputs
+
+    # Press trigger -- chord fires, forwarding flips OFF.
+    src_kb.write(e.EV_KEY, e.KEY_F10, 1); src_kb.syn()
+    await asyncio.sleep(0.15)
+    assert sender.forwarding_on is False, "chord should have flipped OFF"
+
+    # The grab must still be held (trigger finger is down) so that the
+    # compositor on B does not see a synthetic press for the trigger.
+    assert all(s.grabbed for s in sender.sources), (
+        "ungrab fired while trigger still down -- compositor will see synthetic press"
+    )
+    assert sender._waiting_chord_release_code == e.KEY_F10, (
+        "_waiting_chord_release_code should be set while trigger is held"
+    )
+
+    # Release the trigger -- ungrab must fire now.
+    src_kb.write(e.EV_KEY, e.KEY_F10, 0); src_kb.syn()
+    await asyncio.sleep(0.15)
+    assert all(not s.grabbed for s in sender.sources), (
+        "ungrab did not fire after trigger release"
+    )
+    assert sender._waiting_chord_release_code is None
+
+    sender.shutdown()
+    receiver.shutdown()
+    for t in (sender_task, receiver_task):
+        try:
+            await asyncio.wait_for(t, timeout=1.0)
+        except (asyncio.TimeoutError, Exception):
+            t.cancel()
+            try:
+                await t
+            except (asyncio.CancelledError, Exception):
+                pass
+    src_kb.close()
+    sender_out.close()
+
+
 def test_single_key_chord_flips_state():
     """A bare trigger key with no modifiers must still toggle and be eaten."""
     asyncio.run(_single_key_chord())

@@ -132,6 +132,10 @@ class SenderApp:
             u = hid_map.encode_key(code)
             if u is not None:
                 self.toggle_chord_hid.add(u)
+        # When set, we have flipped forwarding_on=False but haven't ungrabbed
+        # yet -- waiting for this evdev code's key-up so the compositor on B
+        # doesn't see a synthetic press for a still-held trigger at ungrab time.
+        self._waiting_chord_release_code: Optional[int] = None
 
     def shutdown(self) -> None:
         self.shutting_down.set()
@@ -304,6 +308,19 @@ class SenderApp:
         return False
 
     async def _dispatch_event(self, src: Source, event: evdev.InputEvent) -> None:
+        # Delay ungrab until the trigger key is physically released so the
+        # compositor on B doesn't receive a synthetic press for a still-held key.
+        if self._waiting_chord_release_code is not None:
+            if event.type == e.EV_KEY:
+                if event.value == 1:
+                    src.held_evdev.add(event.code)
+                elif event.value == 0:
+                    src.held_evdev.discard(event.code)
+                    if event.code == self._waiting_chord_release_code:
+                        self._waiting_chord_release_code = None
+                        self._ungrab_all()
+                        logger.debug("trigger released; ungrabbed")
+            return
         if event.type == e.EV_KEY:
             # Chord must be checked against the pre-event held set --
             # before we record the trigger as held -- so the modifiers
@@ -354,9 +371,15 @@ class SenderApp:
                 # the eventual release.
                 for src in self.sources:
                     await self._emit_empty_full_state(src)
-                self._ungrab_all()
                 self.forwarding_on = False
-                logger.info("forwarding OFF")
+                if self.toggle_trigger_evdev is not None:
+                    # Defer the actual ungrab until the trigger key is released;
+                    # see _dispatch_event's _waiting_chord_release_code block.
+                    self._waiting_chord_release_code = self.toggle_trigger_evdev
+                    logger.info("forwarding OFF (waiting for trigger release to ungrab)")
+                else:
+                    self._ungrab_all()
+                    logger.info("forwarding OFF")
             else:
                 # OFF -> ON. Grab, then reseed the receiver with whatever
                 # the user is still holding -- minus the chord keys, which
