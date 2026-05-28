@@ -40,7 +40,7 @@ from . import hid_map, wire
 logger = logging.getLogger("evpipe-send")
 
 DEFAULT_RESYNC_INTERVAL_S = 0.5
-DEFAULT_TOGGLE_CHORD = ["KEY_LEFTMETA", "KEY_T"]
+DEFAULT_TOGGLE_CHORD = ["KEY_F10"]
 
 
 @dataclass

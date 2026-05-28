@@ -54,16 +54,16 @@ transitions to pressed. The trigger event is consumed (never reaches A),
 and the chord works whether forwarding is currently ON or OFF -- so it
 also serves as the bailout when B's keyboard is grabbed.
 
-The default is `KEY_LEFTMETA,KEY_T` -- hold Super and tap T. Pass an
-empty string to disable toggling entirely (always-on, kill the ssh to
-bail out). If a chord isn't firing, run the sender with
-`--log-level=DEBUG`; the log shows which modifiers were missing when
-the trigger pressed.
+The default is `KEY_F10` -- a single dedicated key, no modifiers, no
+QMK-layer/tap-hold complications. Pass an empty string to disable
+toggling entirely (always-on, kill the ssh to bail out). If a chord
+isn't firing, run the sender with `--log-level=DEBUG`; the log shows
+which modifiers were missing when the trigger pressed.
 
 ```
 ssh user@B '
   evpipe-send --kb /dev/input/event3 --mouse /dev/input/event7 \
-              --toggle-chord KEY_LEFTMETA+KEY_T \
+              --toggle-chord KEY_F10 \
               --start-off
 ' | evpipe-recv
 ```
