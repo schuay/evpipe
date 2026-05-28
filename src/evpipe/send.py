@@ -40,15 +40,7 @@ from . import hid_map, wire
 logger = logging.getLogger("evpipe-send")
 
 DEFAULT_RESYNC_INTERVAL_S = 0.5
-# QMK's `KC_HYPR` expands to LCtrl+LAlt+LShift+LMeta, so "Ctrl-Alt-Hyper-T"
-# at the keymap level lands on the host as the five-key chord below.
-DEFAULT_TOGGLE_CHORD = [
-    "KEY_LEFTCTRL",
-    "KEY_LEFTALT",
-    "KEY_LEFTSHIFT",
-    "KEY_LEFTMETA",
-    "KEY_T",
-]
+DEFAULT_TOGGLE_CHORD = ["KEY_LEFTMETA", "KEY_T"]
 
 
 @dataclass
@@ -288,7 +280,14 @@ class SenderApp:
             return False
         if ev_value != 1 or ev_code != self.toggle_trigger_evdev:
             return False
-        return self.toggle_modifiers_evdev.issubset(src.held_evdev)
+        if self.toggle_modifiers_evdev.issubset(src.held_evdev):
+            return True
+        missing = self.toggle_modifiers_evdev - src.held_evdev
+        logger.debug(
+            "toggle trigger pressed but chord incomplete: missing=%s held=%s",
+            sorted(missing), sorted(src.held_evdev),
+        )
+        return False
 
     async def _dispatch_event(self, src: Source, event: evdev.InputEvent) -> None:
         if event.type == e.EV_KEY:
@@ -452,8 +451,8 @@ def main() -> int:
                              "(never forwarded). Pass an empty string to "
                              "disable toggling entirely. Default: "
                              + ",".join(DEFAULT_TOGGLE_CHORD)
-                             + " (Ctrl-Alt-Hyper-T on QMK boards where "
-                             "KC_HYPR expands to LCtrl+LAlt+LShift+LMeta).")
+                             + ". Run with --log-level=DEBUG to see which "
+                             "modifiers were missing when a chord fails to fire.")
     parser.add_argument("--resync-interval", type=float,
                         default=DEFAULT_RESYNC_INTERVAL_S, metavar="SECONDS",
                         help="FULL_STATE / heartbeat cadence (default: "

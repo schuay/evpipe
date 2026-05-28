@@ -54,15 +54,16 @@ transitions to pressed. The trigger event is consumed (never reaches A),
 and the chord works whether forwarding is currently ON or OFF -- so it
 also serves as the bailout when B's keyboard is grabbed.
 
-The default is `KEY_LEFTCTRL,KEY_LEFTALT,KEY_LEFTSHIFT,KEY_LEFTMETA,KEY_T`,
-which is "Ctrl-Alt-Hyper-T" on a QMK board where `KC_HYPR` expands to
-`LCtrl+LAlt+LShift+LMeta`. Pass an empty string to disable toggling
-entirely (always-on, kill the ssh to bail out).
+The default is `KEY_LEFTMETA,KEY_T` -- hold Super and tap T. Pass an
+empty string to disable toggling entirely (always-on, kill the ssh to
+bail out). If a chord isn't firing, run the sender with
+`--log-level=DEBUG`; the log shows which modifiers were missing when
+the trigger pressed.
 
 ```
 ssh user@B '
   evpipe-send --kb /dev/input/event3 --mouse /dev/input/event7 \
-              --toggle-chord KEY_LEFTCTRL+KEY_LEFTALT+KEY_LEFTSHIFT+KEY_LEFTMETA+KEY_T \
+              --toggle-chord KEY_LEFTMETA+KEY_T \
               --start-off
 ' | evpipe-recv
 ```
