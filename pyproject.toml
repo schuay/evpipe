@@ -18,6 +18,13 @@ dev = [
     "pytest>=8.0",
 ]
 
+[tool.uv]
+# Always use a uv-downloaded python-build-standalone interpreter; never
+# fall back to a system python3 (and the apt-managed headers that go
+# with it). Combined with .python-version, every fresh checkout gets
+# the same 3.11 regardless of what the host distro ships.
+python-preference = "only-managed"
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
