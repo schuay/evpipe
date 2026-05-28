@@ -57,7 +57,7 @@ async def _loopback() -> None:
 
     sender = SenderApp(
         [(src_kb_path, wire.DEV_KB)],
-        toggle_path=None, toggle_code=None,
+        toggle_chord_evdev=[],
         stdout=sender_out,
         resync_interval_s=0.2,
     )
@@ -135,7 +135,7 @@ async def _resync_releases_stuck() -> None:
 
     sender = SenderApp(
         [(src_kb.device.path, wire.DEV_KB)],
-        toggle_path=None, toggle_code=None,
+        toggle_chord_evdev=[],
         stdout=sender_out,
         resync_interval_s=0.1,
     )
@@ -203,7 +203,7 @@ async def _eof_releases() -> None:
 
     sender = SenderApp(
         [(src_kb.device.path, wire.DEV_KB)],
-        toggle_path=None, toggle_code=None,
+        toggle_chord_evdev=[],
         stdout=sender_out,
         resync_interval_s=5.0,  # long, so EOF triggers teardown not resync
     )
@@ -257,6 +257,124 @@ async def _eof_releases() -> None:
                 pass
     src_kb.close()
     recv_kb.close()
+
+
+def test_toggle_chord_eats_trigger_and_flips_state():
+    """Pressing the configured chord must (a) flip forwarding, (b) not
+    leak the trigger key to the receiver."""
+    asyncio.run(_chord_toggle())
+
+
+async def _chord_toggle() -> None:
+    src_kb = evdev.UInput(
+        {e.EV_KEY: [
+            e.KEY_A, e.KEY_T,
+            e.KEY_LEFTCTRL, e.KEY_LEFTALT, e.KEY_LEFTSHIFT, e.KEY_LEFTMETA,
+        ]},
+        name="evpipe-test-chord-src",
+        vendor=0xCAFE, product=0xBAB5,
+    )
+    await asyncio.sleep(0.2)
+
+    rfd, wfd = os.pipe()
+    sender_out = os.fdopen(wfd, "wb", buffering=0)
+    recv_in = os.fdopen(rfd, "rb", buffering=0)
+    loop = asyncio.get_running_loop()
+    reader = asyncio.StreamReader()
+    proto = asyncio.StreamReaderProtocol(reader)
+    await loop.connect_read_pipe(lambda: proto, recv_in)
+
+    chord = [e.KEY_LEFTCTRL, e.KEY_LEFTALT, e.KEY_LEFTSHIFT, e.KEY_LEFTMETA, e.KEY_T]
+    sender = SenderApp(
+        [(src_kb.device.path, wire.DEV_KB)],
+        toggle_chord_evdev=chord,
+        stdout=sender_out,
+        resync_interval_s=5.0,
+        start_forwarding=True,
+    )
+    receiver = ReceiverApp()
+    sender_task = asyncio.create_task(sender.run())
+    receiver_task = asyncio.create_task(receiver.run(reader))
+
+    for _ in range(40):
+        if receiver.uinputs:
+            break
+        await asyncio.sleep(0.05)
+    assert receiver.uinputs
+
+    recv_kb = evdev.InputDevice(receiver.uinputs[0].device.path)
+    out: list[evdev.InputEvent] = []
+
+    async def collect() -> None:
+        async for ev in recv_kb.async_read_loop():
+            out.append(ev)
+
+    collector = asyncio.create_task(collect())
+
+    # Phase 1: forwarding ON -- a plain KEY_A goes through.
+    src_kb.write(e.EV_KEY, e.KEY_A, 1); src_kb.syn()
+    src_kb.write(e.EV_KEY, e.KEY_A, 0); src_kb.syn()
+    await asyncio.sleep(0.15)
+
+    # Phase 2: press the chord -> forwarding flips OFF, trigger consumed.
+    for code in (e.KEY_LEFTCTRL, e.KEY_LEFTALT, e.KEY_LEFTSHIFT, e.KEY_LEFTMETA):
+        src_kb.write(e.EV_KEY, code, 1); src_kb.syn()
+    src_kb.write(e.EV_KEY, e.KEY_T, 1); src_kb.syn()
+    src_kb.write(e.EV_KEY, e.KEY_T, 0); src_kb.syn()
+    for code in (e.KEY_LEFTMETA, e.KEY_LEFTSHIFT, e.KEY_LEFTALT, e.KEY_LEFTCTRL):
+        src_kb.write(e.EV_KEY, code, 0); src_kb.syn()
+    await asyncio.sleep(0.25)
+    assert sender.forwarding_on is False, "chord did not flip forwarding off"
+
+    # Phase 3: forwarding OFF -- plain KEY_A must NOT reach the receiver.
+    src_kb.write(e.EV_KEY, e.KEY_A, 1); src_kb.syn()
+    src_kb.write(e.EV_KEY, e.KEY_A, 0); src_kb.syn()
+    await asyncio.sleep(0.15)
+
+    # Phase 4: chord again -> forwarding ON.
+    for code in (e.KEY_LEFTCTRL, e.KEY_LEFTALT, e.KEY_LEFTSHIFT, e.KEY_LEFTMETA):
+        src_kb.write(e.EV_KEY, code, 1); src_kb.syn()
+    src_kb.write(e.EV_KEY, e.KEY_T, 1); src_kb.syn()
+    src_kb.write(e.EV_KEY, e.KEY_T, 0); src_kb.syn()
+    for code in (e.KEY_LEFTMETA, e.KEY_LEFTSHIFT, e.KEY_LEFTALT, e.KEY_LEFTCTRL):
+        src_kb.write(e.EV_KEY, code, 0); src_kb.syn()
+    await asyncio.sleep(0.25)
+    assert sender.forwarding_on is True, "chord did not flip forwarding back on"
+
+    # Phase 5: forwarding ON -- KEY_A goes through again.
+    src_kb.write(e.EV_KEY, e.KEY_A, 1); src_kb.syn()
+    src_kb.write(e.EV_KEY, e.KEY_A, 0); src_kb.syn()
+    await asyncio.sleep(0.25)
+
+    collector.cancel()
+    try:
+        await collector
+    except (asyncio.CancelledError, Exception):
+        pass
+
+    key_events = [(ev.code, ev.value) for ev in out if ev.type == e.EV_KEY]
+    a_presses = [ev for ev in key_events if ev == (e.KEY_A, 1)]
+    t_events = [ev for ev in key_events if ev[0] == e.KEY_T]
+
+    assert len(a_presses) == 2, (
+        f"expected 2 KEY_A presses (phase 1 + 5), got {len(a_presses)}: {key_events}"
+    )
+    assert not t_events, f"KEY_T leaked to receiver: {key_events}"
+
+    sender.shutdown()
+    receiver.shutdown()
+    for t in (sender_task, receiver_task):
+        try:
+            await asyncio.wait_for(t, timeout=1.0)
+        except (asyncio.TimeoutError, Exception):
+            t.cancel()
+            try:
+                await t
+            except (asyncio.CancelledError, Exception):
+                pass
+    src_kb.close()
+    recv_kb.close()
+    sender_out.close()
 
 
 async def _drain(dev: evdev.InputDevice, window_s: float) -> list[evdev.InputEvent]:

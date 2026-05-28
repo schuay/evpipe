@@ -48,24 +48,27 @@ local compositor.
 
 ## Toggle hotkey
 
-When you want forwarding to be toggleable rather than always-on, point
-`--toggle-device` at a kb whose chord you'll press to flip the switch.
-The toggle device is not grabbed; events flow through to the local
-compositor in addition to being seen by us. Default chord is
-`KEY_SCROLLLOCK` (override with `--toggle-key KEY_NAME`).
+`--toggle-chord` takes a comma- or plus-separated list of evdev key
+names. The last key is the trigger; the rest must be held when it
+transitions to pressed. The trigger event is consumed (never reaches A),
+and the chord works whether forwarding is currently ON or OFF -- so it
+also serves as the bailout when B's keyboard is grabbed.
+
+The default is `KEY_LEFTCTRL,KEY_LEFTALT,KEY_LEFTSHIFT,KEY_LEFTMETA,KEY_T`,
+which is "Ctrl-Alt-Hyper-T" on a QMK board where `KC_HYPR` expands to
+`LCtrl+LAlt+LShift+LMeta`. Pass an empty string to disable toggling
+entirely (always-on, kill the ssh to bail out).
 
 ```
 ssh user@B '
   evpipe-send --kb /dev/input/event3 --mouse /dev/input/event7 \
-              --toggle-device /dev/input/event3 \
-              --toggle-key KEY_SCROLLLOCK \
+              --toggle-chord KEY_LEFTCTRL+KEY_LEFTALT+KEY_LEFTSHIFT+KEY_LEFTMETA+KEY_T \
               --start-off
 ' | evpipe-recv
 ```
 
 `--start-off` is useful when you want B's keyboard to start out
-local-only and flip into forwarding mode only after you press the
-chord. Without `--toggle-device`, forwarding is always on.
+local-only and flip into forwarding mode only after you press the chord.
 
 ## What gets forwarded
 
