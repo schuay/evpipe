@@ -242,9 +242,24 @@ class SenderApp:
             self._write_bytes(data)
 
     async def _emit_full_state(self, src: Source) -> None:
-        """Resync: kernel-sampled ground truth. Used by the resync timer."""
-        # While grabbed, sample the kernel's view of held keys for ground
-        # truth -- our `held` set can drift across SYN_DROPPED etc.
+        """Tell the receiver what should be held.
+
+        While forwarding, kernel `active_keys()` is ground truth -- our
+        own `src.held` set can drift across SYN_DROPPED etc.
+
+        While not forwarding, the answer is unconditionally nothing.
+        Crucially we do *not* resample active_keys in that branch even
+        though `src.grabbed` may still be True (toggle ON->OFF holds the
+        grab until trigger release): the user's finger is on the trigger
+        right now, and an active_keys snapshot would re-press it on the
+        receiver -- then when the user does release it, the waiting-
+        chord branch consumes the release without forwarding, leaving
+        the key stuck on A.
+        """
+        if not self.forwarding_on:
+            src.held.clear()
+            await self._send_full_state_packet(src.device_id, [])
+            return
         held_hid = set(src.held)
         if src.grabbed:
             try:
@@ -258,16 +273,6 @@ class SenderApp:
             except OSError:
                 pass
         await self._send_full_state_packet(src.device_id, sorted(held_hid))
-
-    async def _emit_empty_full_state(self, src: Source) -> None:
-        """Toggle ON->OFF: force the receiver to release everything.
-
-        Crucially does *not* resample active_keys -- the user's finger may
-        still be on the trigger when this fires, and we don't want that
-        leaking onto A and getting stuck once we ungrab.
-        """
-        src.held.clear()
-        await self._send_full_state_packet(src.device_id, [])
 
     async def _send_full_state_packet(self, device_id: int, held: list[int]) -> None:
         data = wire.encode_packet(
@@ -363,15 +368,15 @@ class SenderApp:
         self._toggle_pending = True
         try:
             if self.forwarding_on:
-                # ON -> OFF. Force an empty FULL_STATE so the receiver
-                # releases everything before we ungrab. Importantly we do
-                # NOT resample active_keys here -- the trigger key is
-                # being held right now, and shipping it would leave A's
-                # uinput stuck on it once we ungrab and stop forwarding
-                # the eventual release.
-                for src in self.sources:
-                    await self._emit_empty_full_state(src)
+                # ON -> OFF. Flip the flag first so _emit_full_state takes
+                # the empty-FS branch -- both for this manual emit and for
+                # any concurrent _resync_loop firing during the waiting-
+                # chord-release window that follows. Sampling active_keys
+                # while the trigger is still held would re-press it on
+                # the receiver.
                 self.forwarding_on = False
+                for src in self.sources:
+                    await self._emit_full_state(src)
                 if self.toggle_trigger_evdev is not None:
                     # Defer the actual ungrab until the trigger key is released;
                     # see _dispatch_event's _waiting_chord_release_code block.

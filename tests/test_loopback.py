@@ -378,8 +378,10 @@ async def _chord_toggle() -> None:
 
 
 def test_chord_off_does_not_strand_trigger_on_receiver():
-    """ON->OFF must release the still-held trigger on the receiver side,
-    not leak it via active_keys-based resync that would leave A repeating."""
+    """ON->OFF must release the still-held trigger on the receiver side
+    AND keep it released for the full duration the trigger is held -- a
+    resync firing during the waiting-chord-release window must not
+    re-press it from active_keys."""
     asyncio.run(_chord_off_clears_trigger())
 
 
@@ -399,11 +401,16 @@ async def _chord_off_clears_trigger() -> None:
     proto = asyncio.StreamReaderProtocol(reader)
     await loop.connect_read_pipe(lambda: proto, recv_in)
 
+    # Short resync interval: the real bug was that the periodic resync
+    # re-sampled active_keys while the trigger was still held, re-pressing
+    # it on the receiver and then losing the eventual release event to the
+    # waiting-chord branch. Hold the trigger long enough for multiple
+    # resyncs to fire.
     sender = SenderApp(
         [(src_kb.device.path, wire.DEV_KB)],
         toggle_chord_evdev=[e.KEY_F10],
         stdout=sender_out,
-        resync_interval_s=5.0,
+        resync_interval_s=0.1,
         start_forwarding=True,
     )
     receiver = ReceiverApp()
@@ -416,21 +423,31 @@ async def _chord_off_clears_trigger() -> None:
         await asyncio.sleep(0.05)
     assert receiver.uinputs
 
-    # Simulate a hold-then-release pattern with the trigger still held at
-    # the moment ON->OFF runs (which is what the real-world bug needs).
-    src_kb.write(e.EV_KEY, e.KEY_F10, 1); src_kb.syn()
-    await asyncio.sleep(0.2)
-    assert sender.forwarding_on is False, "chord should have flipped to OFF"
-
-    # The receiver must not be tracking the trigger key as held; otherwise
-    # F10 sits down forever on A and autorepeats.
     f10_hid = (hid_map.HID_PAGE_KEYBOARD << 8) | 0x43  # KEY_F10 -> 0x43
+
+    src_kb.write(e.EV_KEY, e.KEY_F10, 1); src_kb.syn()
+    await asyncio.sleep(0.15)
+    assert sender.forwarding_on is False, "chord should have flipped to OFF"
     assert f10_hid not in receiver.held_per_dev[0], (
-        f"trigger key stuck on receiver: {receiver.held_per_dev[0]}"
+        f"trigger key stuck on receiver after toggle: {receiver.held_per_dev[0]}"
+    )
+
+    # Keep the trigger physically held for several resync intervals. The
+    # pre-fix bug would have a resync re-press F10 here, then drop the
+    # eventual release event in the waiting-chord branch.
+    await asyncio.sleep(0.5)
+    assert f10_hid not in receiver.held_per_dev[0], (
+        f"resync re-pressed trigger on receiver: {receiver.held_per_dev[0]}"
     )
 
     src_kb.write(e.EV_KEY, e.KEY_F10, 0); src_kb.syn()
-    await asyncio.sleep(0.1)
+    await asyncio.sleep(0.2)
+    assert f10_hid not in receiver.held_per_dev[0]
+    # Also: the resync after ungrab must not be sending the stale cached
+    # set either -- src.held should have been cleared on the OFF flip.
+    assert not receiver.held_per_dev[0], (
+        f"residual held codes after trigger release: {receiver.held_per_dev[0]}"
+    )
 
     sender.shutdown()
     receiver.shutdown()
