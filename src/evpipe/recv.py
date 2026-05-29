@@ -11,8 +11,14 @@ emit a release event before destroying the virtual device, so stuck
 modifiers on disconnect can't outlive the link.
 
 FULL_STATE packets act both as the resync mechanism (sender's view of
-what's held, receiver converges via diff) and as the heartbeat. A
-1.5s absence is treated as EOF.
+what's held, receiver converges via diff) and as the heartbeat. Two
+thresholds: at 1.5s without traffic we release every tracked-held
+code (safety -- no stuck modifiers if the sender has actually died)
+but keep the uinput devices alive; if traffic resumes the next
+FULL_STATE diff re-presses anything still held. Only at 10s do we
+declare the link dead and tear the session down. The 10s threshold
+matches the recommended ssh `ServerAliveInterval=5 ServerAliveCountMax=2`
+timeout, so sub-10s blips don't kill an otherwise-recoverable link.
 """
 from __future__ import annotations
 
@@ -31,7 +37,8 @@ from . import hid_map, wire
 
 logger = logging.getLogger("evpipe-recv")
 
-HEARTBEAT_TIMEOUT_S = 1.5
+HEARTBEAT_SAFETY_RELEASE_S = 1.5
+HEARTBEAT_DEAD_S = 10.0
 HEARTBEAT_CHECK_S = 0.25
 UINPUT_NAME_PREFIX = "evpipe: "
 
@@ -189,6 +196,7 @@ class ReceiverApp:
         self.held_per_dev[dev_id] = set(expected)
 
     async def _heartbeat_loop(self) -> None:
+        released = False
         while not self.shutting_down.is_set():
             try:
                 await asyncio.wait_for(
@@ -197,29 +205,38 @@ class ReceiverApp:
                 return
             except asyncio.TimeoutError:
                 pass
-            if time.monotonic() - self._last_packet > HEARTBEAT_TIMEOUT_S:
+            elapsed = time.monotonic() - self._last_packet
+            if elapsed > HEARTBEAT_DEAD_S:
                 logger.warning(
                     "no traffic for %.1fs; treating link as dead",
-                    HEARTBEAT_TIMEOUT_S,
+                    elapsed,
                 )
                 self.shutting_down.set()
                 return
+            if elapsed > HEARTBEAT_SAFETY_RELEASE_S:
+                if not released:
+                    logger.warning(
+                        "no traffic for %.1fs; releasing held keys "
+                        "(link may still recover)",
+                        elapsed,
+                    )
+                    self._release_held()
+                    released = True
+            else:
+                released = False
 
-    async def _teardown(self) -> None:
-        """Release every tracked-held code, then destroy uinput devices.
+    def _release_held(self) -> None:
+        """Release every tracked-held code on every uinput. Idempotent.
 
-        Any one device's flush failure must not skip the others -- a
-        stuck modifier on a half-cleaned tear-down is the exact
-        regression the design's all-up contract exists to prevent.
-
-        The small sleep between the release flush and `ui.close()` lets
-        the kernel propagate the synthetic releases to any waiting
-        readers (compositor, plus our integration tests) before the
-        uinput device is torn down.
+        Used both by the safety branch in `_heartbeat_loop` (uinputs stay
+        alive; recovery is via the next FULL_STATE diff) and by the final
+        flush in `_teardown`.
         """
         for idx, ui in enumerate(self.uinputs):
-            held = self.held_per_dev[idx] if idx < len(self.held_per_dev) else set()
-            for code in held:
+            if idx >= len(self.held_per_dev):
+                continue
+            held = self.held_per_dev[idx]
+            for code in list(held):
                 ec = hid_map.decode_key(code)
                 if ec is not None:
                     try:
@@ -230,6 +247,17 @@ class ReceiverApp:
                 ui.syn()
             except Exception:
                 pass
+            held.clear()
+
+    async def _teardown(self) -> None:
+        """Final all-up flush, then destroy uinput devices.
+
+        The small sleep between the release flush and `ui.close()` lets
+        the kernel propagate the synthetic releases to any waiting
+        readers (compositor, plus our integration tests) before the
+        uinput device is torn down.
+        """
+        self._release_held()
         await asyncio.sleep(0.05)
         for ui in self.uinputs:
             try:

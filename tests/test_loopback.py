@@ -18,7 +18,7 @@ import evdev
 import evdev.ecodes as e
 import pytest
 
-from evpipe import hid_map, wire
+from evpipe import hid_map, recv as recv_mod, wire
 from evpipe.recv import ReceiverApp
 from evpipe.send import SenderApp
 
@@ -640,6 +640,96 @@ async def _single_key_chord() -> None:
     src_kb.close()
     recv_kb.close()
     sender_out.close()
+
+
+def test_safety_release_keeps_session_alive():
+    """A short traffic gap must release tracked-held codes but leave the
+    uinput devices alive; the next FULL_STATE then re-converges."""
+    asyncio.run(_safety_release_recovers())
+
+
+async def _safety_release_recovers() -> None:
+    # Shrink the thresholds so the test runs in well under a second.
+    old_safety = recv_mod.HEARTBEAT_SAFETY_RELEASE_S
+    old_dead = recv_mod.HEARTBEAT_DEAD_S
+    old_check = recv_mod.HEARTBEAT_CHECK_S
+    recv_mod.HEARTBEAT_SAFETY_RELEASE_S = 0.2
+    recv_mod.HEARTBEAT_DEAD_S = 3.0
+    recv_mod.HEARTBEAT_CHECK_S = 0.05
+    try:
+        rfd, wfd = os.pipe()
+        wstream = os.fdopen(wfd, "wb", buffering=0)
+        recv_in = os.fdopen(rfd, "rb", buffering=0)
+        loop = asyncio.get_running_loop()
+        reader = asyncio.StreamReader()
+        proto = asyncio.StreamReaderProtocol(reader)
+        await loop.connect_read_pipe(lambda: proto, recv_in)
+
+        descriptor = wire.DeviceDescriptor(
+            name="evpipe-test-heartbeat-src",
+            vendor_id=0xCAFE, product_id=0xBABA,
+            kind=wire.DEV_KB,
+            keys=[(hid_map.HID_PAGE_KEYBOARD << 8) | 0x04],  # KEY_A
+        )
+        wire.write_session_open(wstream, [descriptor])
+
+        receiver = ReceiverApp()
+        receiver_task = asyncio.create_task(receiver.run(reader))
+
+        for _ in range(40):
+            if receiver.uinputs:
+                break
+            await asyncio.sleep(0.05)
+        assert receiver.uinputs, "receiver never built uinput device"
+
+        hid_a = (hid_map.HID_PAGE_KEYBOARD << 8) | 0x04
+
+        # Phase 1: press KEY_A. Receiver should track it as held.
+        wire.write_event(wstream, wire.Event(wire.EV_KEY, hid_a, 1, 0, 0))
+        wire.write_event(wstream, wire.Event(wire.EV_SYN, 0, 0, 0, 0))
+        await asyncio.sleep(0.1)
+        assert hid_a in receiver.held_per_dev[0], (
+            f"press not registered: {receiver.held_per_dev[0]}"
+        )
+        uinput_count_before = len(receiver.uinputs)
+
+        # Phase 2: stay silent past the safety threshold. Held codes must
+        # be released for safety, but the uinputs and the receiver process
+        # must stay alive.
+        await asyncio.sleep(0.5)
+        assert not receiver.held_per_dev[0], (
+            f"safety release did not clear held: {receiver.held_per_dev[0]}"
+        )
+        assert not receiver.shutting_down.is_set(), (
+            "safety release should not have shut down the session"
+        )
+        assert len(receiver.uinputs) == uinput_count_before, (
+            "safety release destroyed uinputs"
+        )
+
+        # Phase 3: traffic resumes. A FULL_STATE saying KEY_A is held must
+        # re-press it via the converge diff -- the recovery path.
+        wire.write_full_state(wstream, 0, [hid_a])
+        await asyncio.sleep(0.1)
+        assert hid_a in receiver.held_per_dev[0], (
+            f"FULL_STATE did not re-press after safety release: "
+            f"{receiver.held_per_dev[0]}"
+        )
+
+        receiver.shutdown()
+        try:
+            await asyncio.wait_for(receiver_task, timeout=1.0)
+        except (asyncio.TimeoutError, Exception):
+            receiver_task.cancel()
+            try:
+                await receiver_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        wstream.close()
+    finally:
+        recv_mod.HEARTBEAT_SAFETY_RELEASE_S = old_safety
+        recv_mod.HEARTBEAT_DEAD_S = old_dead
+        recv_mod.HEARTBEAT_CHECK_S = old_check
 
 
 async def _drain(dev: evdev.InputDevice, window_s: float) -> list[evdev.InputEvent]:
