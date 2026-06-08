@@ -517,9 +517,10 @@ async def _chord_off_delays_ungrab() -> None:
     assert all(s.grabbed for s in sender.sources), (
         "ungrab fired while trigger still down -- compositor will see synthetic press"
     )
-    assert sender._waiting_chord_release_code == e.KEY_F10, (
-        "_waiting_chord_release_code should be set while trigger is held"
+    assert sender._pending_release == {e.KEY_F10}, (
+        "_pending_release should hold the trigger while it is down"
     )
+    assert sender._pending_grab is False, "ON->OFF completes by ungrabbing"
 
     # Release the trigger -- ungrab must fire now.
     src_kb.write(e.EV_KEY, e.KEY_F10, 0); src_kb.syn()
@@ -527,7 +528,7 @@ async def _chord_off_delays_ungrab() -> None:
     assert all(not s.grabbed for s in sender.sources), (
         "ungrab did not fire after trigger release"
     )
-    assert sender._waiting_chord_release_code is None
+    assert not sender._pending_release
 
     sender.shutdown()
     receiver.shutdown()
@@ -540,6 +541,117 @@ async def _chord_off_delays_ungrab() -> None:
                 await t
             except (asyncio.CancelledError, Exception):
                 pass
+    src_kb.close()
+    sender_out.close()
+
+
+def test_chord_on_does_not_strand_chord_keys_on_source():
+    """OFF->ON must not grab until the chord keys are released, so their
+    key-ups reach a non-grabbing reader of the source (B's local compositor)
+    instead of being captured by the grab and stranded pressed on B.
+
+    The grab boundary is the mirror of the ON->OFF deferred ungrab: the kernel
+    sends no synthetic release to other readers when a grab is taken, so a key
+    held at grab time whose release is then grabbed away sticks pressed on the
+    reader that saw the press."""
+    asyncio.run(_chord_on_no_strand())
+
+
+async def _chord_on_no_strand() -> None:
+    src_kb = evdev.UInput(
+        {e.EV_KEY: [e.KEY_A, e.KEY_LEFTCTRL, e.KEY_F12]},
+        name="evpipe-test-on-strand",
+        vendor=0xCAFE, product=0xBAB9,
+    )
+    await asyncio.sleep(0.2)
+
+    rfd, wfd = os.pipe()
+    sender_out = os.fdopen(wfd, "wb", buffering=0)
+    recv_in = os.fdopen(rfd, "rb", buffering=0)
+    loop = asyncio.get_running_loop()
+    reader = asyncio.StreamReader()
+    proto = asyncio.StreamReaderProtocol(reader)
+    await loop.connect_read_pipe(lambda: proto, recv_in)
+
+    # A second reader of the source stands in for B's local compositor: it
+    # sees events only while the sender is ungrabbed.
+    compositor = evdev.InputDevice(src_kb.device.path)
+
+    sender = SenderApp(
+        [(src_kb.device.path, wire.DEV_KB)],
+        toggle_chord_evdev=[e.KEY_LEFTCTRL, e.KEY_F12],
+        stdout=sender_out,
+        resync_interval_s=5.0,
+        start_forwarding=False,
+    )
+    receiver = ReceiverApp()
+    sender_task = asyncio.create_task(sender.run())
+    receiver_task = asyncio.create_task(receiver.run(reader))
+
+    for _ in range(40):
+        if receiver.uinputs:
+            break
+        await asyncio.sleep(0.05)
+    assert receiver.uinputs
+
+    comp_events: list[evdev.InputEvent] = []
+
+    async def watch_comp() -> None:
+        async for ev in compositor.async_read_loop():
+            comp_events.append(ev)
+
+    watcher = asyncio.create_task(watch_comp())
+
+    # Press the chord. The sender must arm the deferred grab and NOT grab yet --
+    # if it grabbed here, the releases below would be stolen from the compositor.
+    src_kb.write(e.EV_KEY, e.KEY_LEFTCTRL, 1); src_kb.syn()
+    src_kb.write(e.EV_KEY, e.KEY_F12, 1); src_kb.syn()
+    await asyncio.sleep(0.15)
+    assert sender._pending_release == {e.KEY_LEFTCTRL, e.KEY_F12}, (
+        f"OFF->ON should defer the grab on the chord keys: {sender._pending_release}"
+    )
+    assert sender._pending_grab is True, "OFF->ON completes by grabbing"
+    assert all(not s.grabbed for s in sender.sources), (
+        "sender grabbed before the chord released -- key-ups will strand on B"
+    )
+    assert sender.forwarding_on is False
+
+    # Release the chord. Still ungrabbed, so both releases must land on the
+    # compositor reader; the last one then drains the set and triggers the grab.
+    src_kb.write(e.EV_KEY, e.KEY_F12, 0); src_kb.syn()
+    src_kb.write(e.EV_KEY, e.KEY_LEFTCTRL, 0); src_kb.syn()
+    await asyncio.sleep(0.2)
+
+    watcher.cancel()
+    try:
+        await watcher
+    except (asyncio.CancelledError, Exception):
+        pass
+
+    comp_keys = [(ev.code, ev.value) for ev in comp_events if ev.type == e.EV_KEY]
+    assert (e.KEY_F12, 0) in comp_keys, (
+        f"F12 release stranded -- not seen by compositor: {comp_keys}"
+    )
+    assert (e.KEY_LEFTCTRL, 0) in comp_keys, (
+        f"CTRL release stranded -- not seen by compositor: {comp_keys}"
+    )
+    # The deferred grab must have completed once the chord drained.
+    assert sender.forwarding_on is True
+    assert all(s.grabbed for s in sender.sources)
+    assert not sender._pending_release
+
+    sender.shutdown()
+    receiver.shutdown()
+    for t in (sender_task, receiver_task):
+        try:
+            await asyncio.wait_for(t, timeout=1.0)
+        except (asyncio.TimeoutError, Exception):
+            t.cancel()
+            try:
+                await t
+            except (asyncio.CancelledError, Exception):
+                pass
+    compositor.close()
     src_kb.close()
     sender_out.close()
 

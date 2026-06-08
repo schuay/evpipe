@@ -132,10 +132,13 @@ class SenderApp:
             u = hid_map.encode_key(code)
             if u is not None:
                 self.toggle_chord_hid.add(u)
-        # When set, we have flipped forwarding_on=False but haven't ungrabbed
-        # yet -- waiting for this evdev code's key-up so the compositor on B
-        # doesn't see a synthetic press for a still-held trigger at ungrab time.
-        self._waiting_chord_release_code: Optional[int] = None
+        # Deferred toggle state. While `_pending_release` is non-empty we have
+        # decided to flip forwarding but are holding the grab boundary until
+        # these evdev key-ups arrive, so neither B's compositor nor A is left
+        # with a key stuck pressed. `_pending_grab` selects the boundary:
+        # True -> grab on completion (OFF->ON), False -> ungrab (ON->OFF).
+        self._pending_release: set[int] = set()
+        self._pending_grab = False
 
     def shutdown(self) -> None:
         self.shutting_down.set()
@@ -252,8 +255,8 @@ class SenderApp:
         though `src.grabbed` may still be True (toggle ON->OFF holds the
         grab until trigger release): the user's finger is on the trigger
         right now, and an active_keys snapshot would re-press it on the
-        receiver -- then when the user does release it, the waiting-
-        chord branch consumes the release without forwarding, leaving
+        receiver -- then when the user does release it, the deferred-
+        release branch consumes the release without forwarding, leaving
         the key stuck on A.
         """
         if not self.forwarding_on:
@@ -313,18 +316,20 @@ class SenderApp:
         return False
 
     async def _dispatch_event(self, src: Source, event: evdev.InputEvent) -> None:
-        # Delay ungrab until the trigger key is physically released so the
-        # compositor on B doesn't receive a synthetic press for a still-held key.
-        if self._waiting_chord_release_code is not None:
+        # A toggle is mid-flight: we have decided to flip but are holding the
+        # grab boundary until the awaited chord keys are released (see
+        # _begin_deferred_toggle). Swallow every event until then -- nothing is
+        # forwarded, and while ungrabbed (OFF->ON) the key-ups still reach B's
+        # compositor, so they can't strand pressed there.
+        if self._pending_release:
             if event.type == e.EV_KEY:
                 if event.value == 1:
                     src.held_evdev.add(event.code)
                 elif event.value == 0:
                     src.held_evdev.discard(event.code)
-                    if event.code == self._waiting_chord_release_code:
-                        self._waiting_chord_release_code = None
-                        self._ungrab_all()
-                        logger.debug("trigger released; ungrabbed")
+                    self._pending_release.discard(event.code)
+                    if not self._pending_release:
+                        await self._complete_deferred_toggle()
             return
         if event.type == e.EV_KEY:
             # Chord must be checked against the pre-event held set --
@@ -378,25 +383,70 @@ class SenderApp:
                 for src in self.sources:
                     await self._emit_full_state(src)
                 if self.toggle_trigger_evdev is not None:
-                    # Defer the actual ungrab until the trigger key is released;
-                    # see _dispatch_event's _waiting_chord_release_code block.
-                    self._waiting_chord_release_code = self.toggle_trigger_evdev
+                    # Hold the grab until the trigger is released; ungrabbing
+                    # with it still down makes the kernel synthesise a held-
+                    # trigger press to B's compositor. We wait on the trigger
+                    # alone -- a still-held modifier self-heals at ungrab (the
+                    # compositor is live again to receive its release), and
+                    # waiting on it could keep B's keyboard grabbed for as long
+                    # as the user chooses to hold it.
+                    self._begin_deferred_toggle(
+                        grab_on_complete=False,
+                        pending={self.toggle_trigger_evdev},
+                    )
                     logger.info("forwarding OFF (waiting for trigger release to ungrab)")
                 else:
                     self._ungrab_all()
                     logger.info("forwarding OFF")
             else:
-                # OFF -> ON. Grab, then reseed the receiver with whatever
-                # the user is still holding -- minus the chord keys, which
-                # we explicitly do not want to leak onto A.
-                self._grab_all()
-                self.forwarding_on = True
-                for src in self.sources:
-                    self._seed_held_from_kernel(src)
-                    await self._emit_full_state(src)
-                logger.info("forwarding ON")
+                # OFF -> ON. Defer the grab until the chord keys are released.
+                # While off we are ungrabbed, so B's compositor saw the chord
+                # pressed; grabbing now would capture the key-ups and strand
+                # those keys pressed on B. Staying ungrabbed until they release
+                # lets the compositor see the releases. Unlike ON->OFF we must
+                # wait on the modifiers too: the compositor saw them, so any one
+                # still held at grab time would stick. By release time
+                # active_keys is clear of the chord, so the seed/emit at
+                # completion cannot leak it onto A either.
+                pending = {c for c in self.toggle_modifiers_evdev
+                           if c in triggering_src.held_evdev}
+                pending.add(self.toggle_trigger_evdev)
+                self._begin_deferred_toggle(grab_on_complete=True, pending=pending)
+                logger.info("forwarding ON (waiting for chord release to grab)")
         finally:
             self._toggle_pending = False
+
+    def _begin_deferred_toggle(self, *, grab_on_complete: bool,
+                               pending: set[int]) -> None:
+        """Arm a deferred grab/ungrab gated on `pending` keys releasing.
+
+        While `_pending_release` is non-empty, _dispatch_event swallows every
+        source event (nothing is forwarded) and watches for the awaited
+        key-ups; the last one drains the set and runs _complete_deferred_toggle.
+        """
+        self._pending_grab = grab_on_complete
+        self._pending_release = set(pending)
+
+    async def _complete_deferred_toggle(self) -> None:
+        """Cross the grab boundary now that the awaited chord keys have released.
+
+        Mirror images. A pending grab finishes the OFF->ON flip: the chord has
+        reached B's compositor as releases and active_keys no longer reports it,
+        so neither B nor A is left holding it. A pending ungrab finishes ON->OFF:
+        the trigger is up, so releasing the grab won't make the kernel
+        synthesise a held-trigger press to B's compositor.
+        """
+        if self._pending_grab:
+            self._pending_grab = False
+            self._grab_all()
+            self.forwarding_on = True
+            for src in self.sources:
+                self._seed_held_from_kernel(src)
+                await self._emit_full_state(src)
+            logger.debug("chord released; grabbed, forwarding ON")
+        else:
+            self._ungrab_all()
+            logger.debug("trigger released; ungrabbed")
 
     def _seed_held_from_kernel(self, src: Source) -> None:
         """Repopulate `src.held` from the kernel's view, excluding any
