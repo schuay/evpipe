@@ -656,6 +656,114 @@ async def _chord_on_no_strand() -> None:
     sender_out.close()
 
 
+def test_chord_on_defers_grab_until_held_button_released():
+    """OFF->ON must wait for *every* held key/button to release before
+    grabbing, not only the chord. A mouse button held across the toggle would
+    otherwise have its release captured by the grab and strand pressed on B."""
+    asyncio.run(_chord_on_waits_for_button())
+
+
+async def _chord_on_waits_for_button() -> None:
+    # No EV_REL: this source does not look like a mouse, so the host's
+    # qmk-mouse-bridge daemon won't auto-grab it out from under us.
+    src_kb = evdev.UInput(
+        {e.EV_KEY: [e.KEY_A, e.KEY_F12, e.BTN_LEFT]},
+        name="evpipe-test-held-button",
+        vendor=0xCAFE, product=0xBABB,
+    )
+    await asyncio.sleep(0.2)
+
+    rfd, wfd = os.pipe()
+    sender_out = os.fdopen(wfd, "wb", buffering=0)
+    recv_in = os.fdopen(rfd, "rb", buffering=0)
+    loop = asyncio.get_running_loop()
+    reader = asyncio.StreamReader()
+    proto = asyncio.StreamReaderProtocol(reader)
+    await loop.connect_read_pipe(lambda: proto, recv_in)
+
+    compositor = evdev.InputDevice(src_kb.device.path)
+
+    sender = SenderApp(
+        [(src_kb.device.path, wire.DEV_KB)],
+        toggle_chord_evdev=[e.KEY_F12],
+        stdout=sender_out,
+        resync_interval_s=5.0,
+        start_forwarding=False,
+    )
+    receiver = ReceiverApp()
+    sender_task = asyncio.create_task(sender.run())
+    receiver_task = asyncio.create_task(receiver.run(reader))
+
+    for _ in range(40):
+        if receiver.uinputs:
+            break
+        await asyncio.sleep(0.05)
+    assert receiver.uinputs
+
+    comp_events: list[evdev.InputEvent] = []
+
+    async def watch_comp() -> None:
+        async for ev in compositor.async_read_loop():
+            comp_events.append(ev)
+
+    watcher = asyncio.create_task(watch_comp())
+
+    # Hold a mouse button, then tap the chord trigger to switch ON.
+    src_kb.write(e.EV_KEY, e.BTN_LEFT, 1); src_kb.syn()
+    src_kb.write(e.EV_KEY, e.KEY_F12, 1); src_kb.syn()
+    await asyncio.sleep(0.15)
+    assert sender._pending_release == {e.BTN_LEFT, e.KEY_F12}, (
+        f"OFF->ON should wait on the held button too: {sender._pending_release}"
+    )
+    assert all(not s.grabbed for s in sender.sources)
+
+    # Release only the trigger. The grab must stay deferred -- the button is
+    # still down, and grabbing now would strand it on B.
+    src_kb.write(e.EV_KEY, e.KEY_F12, 0); src_kb.syn()
+    await asyncio.sleep(0.15)
+    assert sender._pending_release == {e.BTN_LEFT}, (
+        f"grab must keep waiting for the button after the trigger releases: "
+        f"{sender._pending_release}"
+    )
+    assert all(not s.grabbed for s in sender.sources), (
+        "grabbed with the button still held -- its release will strand on B"
+    )
+    assert sender.forwarding_on is False
+
+    # Release the button -- now the grab fires.
+    src_kb.write(e.EV_KEY, e.BTN_LEFT, 0); src_kb.syn()
+    await asyncio.sleep(0.15)
+
+    watcher.cancel()
+    try:
+        await watcher
+    except (asyncio.CancelledError, Exception):
+        pass
+
+    comp_keys = [(ev.code, ev.value) for ev in comp_events if ev.type == e.EV_KEY]
+    assert (e.BTN_LEFT, 0) in comp_keys, (
+        f"button release stranded -- not seen by compositor: {comp_keys}"
+    )
+    assert sender.forwarding_on is True
+    assert all(s.grabbed for s in sender.sources)
+    assert not sender._pending_release
+
+    sender.shutdown()
+    receiver.shutdown()
+    for t in (sender_task, receiver_task):
+        try:
+            await asyncio.wait_for(t, timeout=1.0)
+        except (asyncio.TimeoutError, Exception):
+            t.cancel()
+            try:
+                await t
+            except (asyncio.CancelledError, Exception):
+                pass
+    compositor.close()
+    src_kb.close()
+    sender_out.close()
+
+
 def test_single_key_chord_flips_state():
     """A bare trigger key with no modifiers must still toggle and be eaten."""
     asyncio.run(_single_key_chord())

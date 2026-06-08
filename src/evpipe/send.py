@@ -338,7 +338,7 @@ class SenderApp:
             if self._chord_fires(src, event.code, event.value):
                 # The trigger never reaches the receiver, and never makes
                 # it into held_evdev either.
-                await self._toggle(src)
+                await self._toggle()
                 return
             if event.value == 1:
                 src.held_evdev.add(event.code)
@@ -367,7 +367,7 @@ class SenderApp:
             await self._emit_event(wire.EV_SYN, 0, 0, src.device_id)
         # EV_ABS, EV_MSC, EV_LED, etc. dropped for v1.
 
-    async def _toggle(self, triggering_src: Source) -> None:
+    async def _toggle(self) -> None:
         if self._toggle_pending:
             return
         self._toggle_pending = True
@@ -399,20 +399,26 @@ class SenderApp:
                     self._ungrab_all()
                     logger.info("forwarding OFF")
             else:
-                # OFF -> ON. Defer the grab until the chord keys are released.
-                # While off we are ungrabbed, so B's compositor saw the chord
-                # pressed; grabbing now would capture the key-ups and strand
-                # those keys pressed on B. Staying ungrabbed until they release
-                # lets the compositor see the releases. Unlike ON->OFF we must
-                # wait on the modifiers too: the compositor saw them, so any one
-                # still held at grab time would stick. By release time
-                # active_keys is clear of the chord, so the seed/emit at
-                # completion cannot leak it onto A either.
-                pending = {c for c in self.toggle_modifiers_evdev
-                           if c in triggering_src.held_evdev}
+                # OFF -> ON. Defer the grab until every key/button currently
+                # held is released -- not just the chord. While off we are
+                # ungrabbed, so B's compositor saw all of them pressed; grabbing
+                # with any still down would capture its key-up and strand it
+                # pressed on B (the kernel sends no synthetic release to other
+                # readers on grab). active_keys() across the sources is exactly
+                # that held set, and already covers the chord modifiers and any
+                # held mouse button. By release time it is empty, so the
+                # seed/emit at completion cannot leak anything onto A either.
+                # Cost: holding the chord (or a drag) delays the grab until you
+                # let go, but B stays usable locally in the meantime.
+                pending: set[int] = set()
+                for src in self.sources:
+                    try:
+                        pending |= set(src.dev.active_keys())
+                    except OSError:
+                        pass
                 pending.add(self.toggle_trigger_evdev)
                 self._begin_deferred_toggle(grab_on_complete=True, pending=pending)
-                logger.info("forwarding ON (waiting for chord release to grab)")
+                logger.info("forwarding ON (waiting for held keys to release to grab)")
         finally:
             self._toggle_pending = False
 
