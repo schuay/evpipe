@@ -185,9 +185,12 @@ class SenderApp:
                                              name=f"src:{src.path}"))
         tasks.append(asyncio.create_task(self._resync_loop(), name="resync"))
 
-        server = await self._start_dictation_server()
-
+        server = None
         try:
+            # Inside the try so a socket-bind failure still hits teardown:
+            # by now the sources may be grabbed, and the teardown contract
+            # requires ungrabbing on every exit path.
+            server = await self._start_dictation_server()
             await self.shutting_down.wait()
         finally:
             for t in tasks:
