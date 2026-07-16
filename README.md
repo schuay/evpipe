@@ -71,6 +71,35 @@ ssh user@B '
 `--start-off` is useful when you want B's keyboard to start out
 local-only and flip into forwarding mode only after you press the chord.
 
+## Action hotkeys while grabbed
+
+Once forwarding is ON the sender holds `EVIOCGRAB`, so B's compositor
+sees nothing from the keyboard and its own key bindings go dead. To keep
+a specific local hotkey alive in that state, `--action-chord
+CHORD:COMMAND` runs a shell command when the chord fires, using the same
+detection path as the toggle chord. It fires *only while grabbed* -- when
+ungrabbed, B's compositor still sees the key and runs its own binding, so
+firing here too would double-trigger. The trigger key is consumed (never
+forwarded). Repeatable; triggers must be distinct.
+
+```
+evpipe-send --kb /dev/input/event3 \
+  --action-chord 'KEY_LEFTMETA+KEY_D:echo toggle > $XDG_RUNTIME_DIR/dictate.fifo'
+```
+
+## Dictation over the link
+
+`--dictation-socket PATH` opens a local unix socket that accepts one JSON
+object per line, `{"text": "...", "submit": bool}`, and replies
+`{"routed": "remote"}` or `{"routed": "local"}`. While forwarding is ON
+the text is typed on the receiver (converted to key events on the first
+keyboard source -- no extra virtual device on either host); while OFF the
+sender replies `local` so the caller types it itself. This pairs with
+whisper.cpp's `dictate.py --emit-socket`: one dictation setup follows
+your focus, typing on A when you're driving A and locally via `wtype`
+when you're not. Only US-layout printable characters survive the remote
+path (accented letters/emoji have no HID key and are dropped).
+
 ## What gets forwarded
 
 * Keyboard keys on the HID Keyboard usage page (a-z, 0-9, modifiers,

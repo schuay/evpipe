@@ -25,7 +25,9 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import logging
+import os
 import signal
 import sys
 import time
@@ -66,6 +68,10 @@ class Source:
     held: set[int] = field(default_factory=set)
     held_evdev: set[int] = field(default_factory=set)
     grabbed: bool = False
+    # evdev codes whose next release must be swallowed (not forwarded). An
+    # action chord fires on the trigger press and consumes it; the matching
+    # release would otherwise leak to the receiver as a lone key-up.
+    swallow_release: set[int] = field(default_factory=set)
 
 
 def _build_descriptor(dev: evdev.InputDevice, role: int) -> wire.DeviceDescriptor:
@@ -109,6 +115,8 @@ class SenderApp:
         stdout: BinaryIO,
         resync_interval_s: float = DEFAULT_RESYNC_INTERVAL_S,
         start_forwarding: bool = True,
+        action_chords: Optional[list[tuple[list[int], str]]] = None,
+        dictation_socket: Optional[str] = None,
     ) -> None:
         self.source_paths = source_paths
         self.stdout = stdout
@@ -119,6 +127,19 @@ class SenderApp:
         self._t0 = time.monotonic()
         self._write_lock = asyncio.Lock()
         self._toggle_pending = False  # debounce flag
+        # Action chords: (chord_evdev_codes, shell_command). Each fires like the
+        # toggle chord (modifiers held + trigger press) but runs a shell command
+        # instead of flipping forwarding, and ONLY while grabbed -- ungrabbed,
+        # the local compositor still sees the key and runs its own binding, so
+        # firing here too would double-trigger. Indexed by trigger code for the
+        # dispatch-path lookup; a trigger may not be shared across chords.
+        self.action_chords: list[tuple[list[int], str]] = list(action_chords or [])
+        self._action_by_trigger: dict[int, tuple[set[int], str]] = {}
+        for codes, cmd in self.action_chords:
+            if not codes:
+                continue
+            self._action_by_trigger[codes[-1]] = (set(codes[:-1]), cmd)
+        self.dictation_socket_path = dictation_socket
         # Chord state. Empty list disables toggling (always-on).
         self.toggle_chord_evdev = list(toggle_chord_evdev)
         self.toggle_modifiers_evdev: set[int] = (
@@ -164,6 +185,8 @@ class SenderApp:
                                              name=f"src:{src.path}"))
         tasks.append(asyncio.create_task(self._resync_loop(), name="resync"))
 
+        server = await self._start_dictation_server()
+
         try:
             await self.shutting_down.wait()
         finally:
@@ -173,6 +196,16 @@ class SenderApp:
                 try:
                     await t
                 except (asyncio.CancelledError, Exception):
+                    pass
+            if server is not None:
+                server.close()
+                try:
+                    await server.wait_closed()
+                except Exception:
+                    pass
+                try:
+                    os.unlink(self.dictation_socket_path)
+                except OSError:
                     pass
             self._teardown()
 
@@ -239,8 +272,7 @@ class SenderApp:
             return False
 
     async def _emit_event(self, ev_kind: int, code: int, value: int, device_id: int) -> None:
-        ev = wire.Event(ev_kind, code, value, self._ts_us(), device_id)
-        data = wire.encode_packet(wire.PACKET_EVENT, wire.encode_event(ev))
+        data = self._event_bytes(ev_kind, code, value, device_id)
         async with self._write_lock:
             self._write_bytes(data)
 
@@ -315,6 +347,41 @@ class SenderApp:
         )
         return False
 
+    def _action_command(self, src: Source, ev_code: int, ev_value: int) -> Optional[str]:
+        """The shell command for an action chord firing on this event, or None.
+
+        Fires only while grabbed: ungrabbed, the local compositor still sees
+        the key and runs its own binding, so acting here too would double-
+        trigger. Same modifier match as the toggle chord, against held_evdev."""
+        if not src.grabbed or ev_value != 1:
+            return None
+        entry = self._action_by_trigger.get(ev_code)
+        if entry is None:
+            return None
+        modifiers, cmd = entry
+        if modifiers.issubset(src.held_evdev):
+            return cmd
+        logger.debug(
+            "action trigger pressed but chord incomplete: missing=%s held=%s",
+            sorted(modifiers - src.held_evdev), sorted(src.held_evdev),
+        )
+        return None
+
+    async def _run_action(self, cmd: str) -> None:
+        """Fire-and-forget a chord's shell command; never blocks dispatch."""
+        try:
+            proc = await asyncio.create_subprocess_shell(
+                cmd,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+        except OSError as exc:
+            logger.warning("action command failed to spawn: %s", exc)
+            return
+        # Reap it in the background so it can't become a zombie, without
+        # holding up the read loop.
+        asyncio.create_task(proc.wait())
+
     async def _dispatch_event(self, src: Source, event: evdev.InputEvent) -> None:
         # A toggle is mid-flight: we have decided to flip but are holding the
         # grab boundary until the awaited chord keys are released (see
@@ -332,6 +399,13 @@ class SenderApp:
                         await self._complete_deferred_toggle()
             return
         if event.type == e.EV_KEY:
+            # An action chord swallows its trigger key entirely: the press
+            # fired the command, and the release (and any autorepeat in
+            # between) must not leak to the receiver as a lone key event.
+            if event.code in src.swallow_release:
+                if event.value == 0:
+                    src.swallow_release.discard(event.code)
+                return
             # Chord must be checked against the pre-event held set --
             # before we record the trigger as held -- so the modifiers
             # alone are what's being matched.
@@ -339,6 +413,14 @@ class SenderApp:
                 # The trigger never reaches the receiver, and never makes
                 # it into held_evdev either.
                 await self._toggle()
+                return
+            cmd = self._action_command(src, event.code, event.value)
+            if cmd is not None:
+                # Consume the trigger: run the command, and swallow this
+                # press plus the matching release. The trigger never enters
+                # held_evdev, mirroring the toggle chord.
+                src.swallow_release.add(event.code)
+                await self._run_action(cmd)
                 return
             if event.value == 1:
                 src.held_evdev.add(event.code)
@@ -470,6 +552,121 @@ class SenderApp:
                 continue
             src.held.add(u)
 
+    async def _start_dictation_server(self):
+        """Listen on a local unix socket for transcribed text to inject.
+
+        Returns the asyncio server (or None if no path configured). The
+        socket is the control plane for dictation: a client (dictate.py)
+        sends one JSON object per paragraph and reads one back telling it
+        whether we injected the text to the receiver or it should type
+        locally. Trust boundary is the user's session -- mode 0600, same as
+        the FIFO the toggle hotkey uses.
+        """
+        if not self.dictation_socket_path:
+            return None
+        try:
+            os.unlink(self.dictation_socket_path)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            logger.warning("dictation socket %s not removable: %s",
+                           self.dictation_socket_path, exc)
+        server = await asyncio.start_unix_server(
+            self._handle_dictation_client, path=self.dictation_socket_path)
+        try:
+            os.chmod(self.dictation_socket_path, 0o600)
+        except OSError:
+            pass
+        logger.info("dictation socket listening at %s", self.dictation_socket_path)
+        return server
+
+    async def _handle_dictation_client(self, reader: asyncio.StreamReader,
+                                       writer: asyncio.StreamWriter) -> None:
+        """One request/response per connection.
+
+        Request:  {"text": "...", "submit": bool}
+        Response: {"routed": "remote"}  -- we injected it to the receiver
+                  {"routed": "local"}   -- caller should type it locally
+
+        The routing decision is `forwarding_on`: while forwarding, the user
+        is looking at the receiver, so keystrokes belong there; otherwise
+        the caller's local wtype is the right sink. A missing text field or
+        malformed line is answered "local" so the caller still gets its
+        paragraph out.
+        """
+        try:
+            raw = await reader.readline()
+            try:
+                msg = json.loads(raw.decode("utf-8"))
+                text = msg.get("text", "")
+                submit = bool(msg.get("submit", False))
+            except (ValueError, AttributeError):
+                text, submit = "", False
+            routed = "local"
+            if text and self.forwarding_on:
+                await self._inject_text(text, submit)
+                routed = "remote"
+            writer.write((json.dumps({"routed": routed}) + "\n").encode("utf-8"))
+            await writer.drain()
+        except (ConnectionError, OSError):
+            pass
+        finally:
+            try:
+                writer.close()
+            except Exception:
+                pass
+
+    def _dictation_target(self) -> Optional[Source]:
+        """The source whose uinput on the receiver gets injected text: the
+        first keyboard/combo source. Injected keys ride that device's id so
+        no extra virtual device is needed on either host."""
+        for src in self.sources:
+            if src.role in (wire.DEV_KB, wire.DEV_COMBO):
+                return src
+        return self.sources[0] if self.sources else None
+
+    async def _inject_text(self, text: str, submit: bool) -> None:
+        """Convert text to synthetic key events on the target device.
+
+        Each character becomes press/release of its US-layout key, with a
+        shift wrapper when needed. Injected keys are deliberately kept out
+        of `src.held`: they are transient, and the FULL_STATE resync samples
+        the physical device, so leaving them untracked keeps synthetic input
+        from racing the user's real typing. Characters with no US-layout key
+        are dropped (logged once in aggregate)."""
+        src = self._dictation_target()
+        if src is None:
+            return
+        if submit and not text.endswith("\n"):
+            text = text + "\n"
+        dropped = 0
+        shift_hid = hid_map.encode_key(e.KEY_LEFTSHIFT)
+        for ch in text:
+            mapped = hid_map.encode_char(ch)
+            if mapped is None:
+                dropped += 1
+                continue
+            ev_key, needs_shift = mapped
+            u = hid_map.encode_key(ev_key)
+            if u is None:
+                dropped += 1
+                continue
+            async with self._write_lock:
+                if needs_shift and shift_hid is not None:
+                    self._write_bytes(self._event_bytes(wire.EV_KEY, shift_hid, 1, src.device_id))
+                self._write_bytes(self._event_bytes(wire.EV_KEY, u, 1, src.device_id))
+                self._write_bytes(self._event_bytes(wire.EV_SYN, 0, 0, src.device_id))
+                self._write_bytes(self._event_bytes(wire.EV_KEY, u, 0, src.device_id))
+                if needs_shift and shift_hid is not None:
+                    self._write_bytes(self._event_bytes(wire.EV_KEY, shift_hid, 0, src.device_id))
+                self._write_bytes(self._event_bytes(wire.EV_SYN, 0, 0, src.device_id))
+        if dropped:
+            logger.debug("dictation: dropped %d char(s) with no US-layout key", dropped)
+
+    def _event_bytes(self, ev_kind: int, code: int, value: int, device_id: int) -> bytes:
+        ev = wire.Event(ev_kind, code, value, self._ts_us(), device_id)
+        return wire.encode_packet(wire.PACKET_EVENT, wire.encode_event(ev))
+
     async def _resync_loop(self) -> None:
         while not self.shutting_down.is_set():
             try:
@@ -504,6 +701,24 @@ def _parse_chord(spec: str) -> list[int]:
     sep = "," if "," in spec else "+"
     names = [p.strip() for p in spec.split(sep) if p.strip()]
     return [_resolve_evdev_key(n) for n in names]
+
+
+def _parse_action_chord(spec: str) -> tuple[list[int], str]:
+    """Parse ``CHORD:COMMAND`` into (evdev codes, command).
+
+    The command may itself contain colons, so split on the first only. The
+    chord uses the same syntax as --toggle-chord; the command is passed to a
+    shell verbatim.
+    """
+    chord_part, sep, cmd = spec.partition(":")
+    if not sep or not cmd.strip():
+        raise argparse.ArgumentTypeError(
+            f"action chord needs CHORD:COMMAND, got {spec!r}")
+    codes = _parse_chord(chord_part)
+    if not codes:
+        raise argparse.ArgumentTypeError(
+            f"action chord has an empty key list: {spec!r}")
+    return codes, cmd
 
 
 def list_input_devices() -> int:
@@ -556,6 +771,26 @@ def main() -> int:
                              "Default: " + ",".join(DEFAULT_TOGGLE_CHORD)
                              + ". Run with --log-level=DEBUG to see which "
                              "modifiers were missing when a chord fails to fire.")
+    parser.add_argument("--action-chord", action="append", default=[],
+                        metavar="K1+...+TRIGGER:COMMAND",
+                        help="run a shell command when a chord fires while "
+                             "forwarding is ON (grabbed). Same chord syntax as "
+                             "--toggle-chord, then a colon, then the command. "
+                             "The chord fires ONLY while grabbed -- when "
+                             "ungrabbed the local compositor still sees the key "
+                             "and runs its own binding. The trigger is consumed "
+                             "(never forwarded). Use to reach a local hotkey "
+                             "(e.g. dictation) whose compositor binding the grab "
+                             "would otherwise hide. Repeatable; triggers must be "
+                             "distinct. Example: "
+                             "KEY_LEFTMETA+KEY_D:'echo toggle > $XDG_RUNTIME_DIR/dictate.fifo'.")
+    parser.add_argument("--dictation-socket", metavar="PATH",
+                        help="listen on this unix socket for transcribed text "
+                             "to inject. While forwarding is ON the text is "
+                             "typed on the receiver via the first keyboard "
+                             "source; while OFF the sender replies 'local' so "
+                             "the client types it itself. Pairs with "
+                             "dictate.py --emit-socket.")
     parser.add_argument("--resync-interval", type=float,
                         default=DEFAULT_RESYNC_INTERVAL_S, metavar="SECONDS",
                         help="FULL_STATE / heartbeat cadence (default: "
@@ -592,6 +827,16 @@ def main() -> int:
     if args.start_off and not toggle_chord:
         parser.error("--start-off requires a non-empty --toggle-chord")
 
+    action_chords: list[tuple[list[int], str]] = []
+    seen_triggers: set[int] = set()
+    for spec in args.action_chord:
+        codes, cmd = _parse_action_chord(spec)
+        trigger = codes[-1]
+        if trigger in seen_triggers:
+            parser.error(f"action-chord trigger reused: {spec!r}")
+        seen_triggers.add(trigger)
+        action_chords.append((codes, cmd))
+
     # Default: SIGPIPE delivers BrokenPipeError on writes (not termination)
     # so the try/finally in run() can ungrab everything before exit.
     signal.signal(signal.SIGPIPE, signal.SIG_IGN)
@@ -602,6 +847,8 @@ def main() -> int:
         stdout=sys.stdout.buffer,
         resync_interval_s=args.resync_interval,
         start_forwarding=not args.start_off,
+        action_chords=action_chords,
+        dictation_socket=args.dictation_socket,
     )
     asyncio.run(_amain(app))
     return 0

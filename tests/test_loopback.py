@@ -952,6 +952,114 @@ async def _safety_release_recovers() -> None:
         recv_mod.HEARTBEAT_CHECK_S = old_check
 
 
+def test_action_chord_fires_only_grabbed_and_eats_trigger():
+    """An action chord must run its command and swallow the trigger while
+    grabbed, and do neither (leaving the key to the local compositor) while
+    ungrabbed."""
+    asyncio.run(_action_chord())
+
+
+async def _action_chord() -> None:
+    src_kb = evdev.UInput(
+        {e.EV_KEY: [e.KEY_A, e.KEY_F9, e.KEY_F10]},
+        name="evpipe-test-action-src",
+        vendor=0xCAFE, product=0xBAB7,
+    )
+    await asyncio.sleep(0.2)
+
+    rfd, wfd = os.pipe()
+    sender_out = os.fdopen(wfd, "wb", buffering=0)
+    recv_in = os.fdopen(rfd, "rb", buffering=0)
+    loop = asyncio.get_running_loop()
+    reader = asyncio.StreamReader()
+    proto = asyncio.StreamReaderProtocol(reader)
+    await loop.connect_read_pipe(lambda: proto, recv_in)
+
+    marker = os.path.join(
+        os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "evpipe-test-action.marker")
+    if os.path.exists(marker):
+        os.unlink(marker)
+
+    sender = SenderApp(
+        [(src_kb.device.path, wire.DEV_KB)],
+        toggle_chord_evdev=[e.KEY_F10],  # distinct from the action trigger
+        stdout=sender_out,
+        resync_interval_s=5.0,
+        start_forwarding=True,
+        action_chords=[([e.KEY_F9], f"echo fired >> {marker}")],
+    )
+    receiver = ReceiverApp()
+    sender_task = asyncio.create_task(sender.run())
+    receiver_task = asyncio.create_task(receiver.run(reader))
+
+    for _ in range(40):
+        if receiver.uinputs:
+            break
+        await asyncio.sleep(0.05)
+    assert receiver.uinputs
+
+    recv_kb = evdev.InputDevice(receiver.uinputs[0].device.path)
+    out: list[evdev.InputEvent] = []
+
+    async def collect() -> None:
+        async for ev in recv_kb.async_read_loop():
+            out.append(ev)
+
+    collector = asyncio.create_task(collect())
+
+    async def marker_lines() -> int:
+        if not os.path.exists(marker):
+            return 0
+        with open(marker) as f:
+            return sum(1 for _ in f)
+
+    # Grabbed: tap F9 -> command fires, trigger swallowed.
+    src_kb.write(e.EV_KEY, e.KEY_F9, 1); src_kb.syn()
+    src_kb.write(e.EV_KEY, e.KEY_F9, 0); src_kb.syn()
+    await asyncio.sleep(0.25)
+    assert await marker_lines() == 1, "action command did not fire while grabbed"
+
+    # Flip forwarding OFF via the toggle chord (F10), so we are ungrabbed.
+    src_kb.write(e.EV_KEY, e.KEY_F10, 1); src_kb.syn()
+    src_kb.write(e.EV_KEY, e.KEY_F10, 0); src_kb.syn()
+    await asyncio.sleep(0.2)
+    assert sender.forwarding_on is False
+
+    # Ungrabbed: tapping F9 must NOT fire the command (the local compositor
+    # owns the key in this state).
+    src_kb.write(e.EV_KEY, e.KEY_F9, 1); src_kb.syn()
+    src_kb.write(e.EV_KEY, e.KEY_F9, 0); src_kb.syn()
+    await asyncio.sleep(0.25)
+    assert await marker_lines() == 1, "action command fired while ungrabbed"
+
+    collector.cancel()
+    try:
+        await collector
+    except (asyncio.CancelledError, Exception):
+        pass
+
+    # The trigger key never reached the receiver in either state.
+    f9_events = [ev for ev in out if ev.type == e.EV_KEY and ev.code == e.KEY_F9]
+    assert not f9_events, f"KEY_F9 leaked to receiver: {f9_events}"
+
+    if os.path.exists(marker):
+        os.unlink(marker)
+    sender.shutdown()
+    receiver.shutdown()
+    for t in (sender_task, receiver_task):
+        try:
+            await asyncio.wait_for(t, timeout=1.0)
+        except (asyncio.TimeoutError, Exception):
+            t.cancel()
+            try:
+                await t
+            except (asyncio.CancelledError, Exception):
+                pass
+    src_kb.close()
+    recv_kb.close()
+    sender_out.close()
+
+
 async def _drain(dev: evdev.InputDevice, window_s: float) -> list[evdev.InputEvent]:
     out: list[evdev.InputEvent] = []
 

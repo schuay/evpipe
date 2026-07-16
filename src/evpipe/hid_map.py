@@ -140,6 +140,65 @@ REL_TO_AXIS: dict[int, int] = {
 AXIS_TO_REL: dict[int, int] = {v: k for k, v in REL_TO_AXIS.items()}
 
 
+# US-layout character -> (evdev key, shift held). Used by the sender's text
+# injection path (dictation): a transcribed paragraph is turned into synthetic
+# key events by looking each character up here, then encoding the evdev key
+# through the keyboard table above. Only the printable ASCII a stock US layout
+# can reach is covered; anything outside it (accented letters, emoji) has no
+# HID key and is dropped by the caller. "\n" maps to Enter so --submit-style
+# newlines work.
+_CHAR_KEY_UNSHIFTED: list[tuple[str, int]] = [
+    ("a", e.KEY_A), ("b", e.KEY_B), ("c", e.KEY_C), ("d", e.KEY_D),
+    ("e", e.KEY_E), ("f", e.KEY_F), ("g", e.KEY_G), ("h", e.KEY_H),
+    ("i", e.KEY_I), ("j", e.KEY_J), ("k", e.KEY_K), ("l", e.KEY_L),
+    ("m", e.KEY_M), ("n", e.KEY_N), ("o", e.KEY_O), ("p", e.KEY_P),
+    ("q", e.KEY_Q), ("r", e.KEY_R), ("s", e.KEY_S), ("t", e.KEY_T),
+    ("u", e.KEY_U), ("v", e.KEY_V), ("w", e.KEY_W), ("x", e.KEY_X),
+    ("y", e.KEY_Y), ("z", e.KEY_Z),
+    ("1", e.KEY_1), ("2", e.KEY_2), ("3", e.KEY_3), ("4", e.KEY_4),
+    ("5", e.KEY_5), ("6", e.KEY_6), ("7", e.KEY_7), ("8", e.KEY_8),
+    ("9", e.KEY_9), ("0", e.KEY_0),
+    (" ", e.KEY_SPACE), ("\n", e.KEY_ENTER), ("\t", e.KEY_TAB),
+    ("-", e.KEY_MINUS), ("=", e.KEY_EQUAL),
+    ("[", e.KEY_LEFTBRACE), ("]", e.KEY_RIGHTBRACE),
+    ("\\", e.KEY_BACKSLASH), (";", e.KEY_SEMICOLON),
+    ("'", e.KEY_APOSTROPHE), ("`", e.KEY_GRAVE),
+    (",", e.KEY_COMMA), (".", e.KEY_DOT), ("/", e.KEY_SLASH),
+]
+
+# Shifted characters share the same key with shift held. The unshifted glyph on
+# each key is given in the comment for cross-checking against a US keyboard.
+_CHAR_KEY_SHIFTED: list[tuple[str, int]] = [
+    ("!", e.KEY_1), ("@", e.KEY_2), ("#", e.KEY_3), ("$", e.KEY_4),
+    ("%", e.KEY_5), ("^", e.KEY_6), ("&", e.KEY_7), ("*", e.KEY_8),
+    ("(", e.KEY_9), (")", e.KEY_0),
+    ("_", e.KEY_MINUS), ("+", e.KEY_EQUAL),
+    ("{", e.KEY_LEFTBRACE), ("}", e.KEY_RIGHTBRACE),
+    ("|", e.KEY_BACKSLASH), (":", e.KEY_SEMICOLON),
+    ('"', e.KEY_APOSTROPHE), ("~", e.KEY_GRAVE),
+    ("<", e.KEY_COMMA), (">", e.KEY_DOT), ("?", e.KEY_SLASH),
+]
+
+CHAR_TO_KEY: dict[str, tuple[int, bool]] = {}
+for _ch, _code in _CHAR_KEY_UNSHIFTED:
+    CHAR_TO_KEY[_ch] = (_code, False)
+for _ch, _code in _CHAR_KEY_SHIFTED:
+    CHAR_TO_KEY[_ch] = (_code, True)
+# Uppercase letters are the lowercase key with shift held.
+for _ch, _code in _CHAR_KEY_UNSHIFTED:
+    if _ch.isalpha():
+        CHAR_TO_KEY[_ch.upper()] = (_code, True)
+
+
+def encode_char(ch: str) -> tuple[int, bool] | None:
+    """Map one character to (evdev key code, shift held), US layout.
+
+    Returns None for characters with no US-layout key (accented letters,
+    emoji, control chars other than tab/newline). The caller drops these.
+    """
+    return CHAR_TO_KEY.get(ch)
+
+
 def encode_key(evdev_code: int) -> int | None:
     """Translate an evdev KEY_*/BTN_* code to a packed HID wire code.
 
