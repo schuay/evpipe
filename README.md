@@ -87,6 +87,14 @@ evpipe-send --kb /dev/input/event3 \
   --action-chord 'KEY_LEFTMETA+KEY_D:echo toggle > $XDG_RUNTIME_DIR/dictate.fifo'
 ```
 
+With a bare-modifier chord like `Super+D`, the modifier is forwarded to A
+before the trigger reveals the chord, so A sees a lone `Super` tap (which
+opens the GNOME overview, etc.). `--local-only KEY_LEFTMETA` keeps that
+modifier out of the wire entirely -- it still counts toward chord
+matching but is never forwarded nor put in the resync snapshot. The
+tradeoff is that the key is then unusable on A (no `Super+Tab`); if you
+need it there, use a bare-key action chord instead.
+
 ## Dictation over the link
 
 `--dictation-socket PATH` opens a local unix socket that accepts one JSON

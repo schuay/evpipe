@@ -117,6 +117,7 @@ class SenderApp:
         start_forwarding: bool = True,
         action_chords: Optional[list[tuple[list[int], str]]] = None,
         dictation_socket: Optional[str] = None,
+        local_only_evdev: Optional[list[int]] = None,
     ) -> None:
         self.source_paths = source_paths
         self.stdout = stdout
@@ -140,6 +141,22 @@ class SenderApp:
                 continue
             self._action_by_trigger[codes[-1]] = (set(codes[:-1]), cmd)
         self.dictation_socket_path = dictation_socket
+        # Keys that update chord state but are never forwarded to the receiver,
+        # nor included in the FULL_STATE resync snapshot. Used to keep a
+        # modifier (e.g. LEFTMETA) out of a bare-modifier chord like Super+D
+        # from tapping the remote compositor's overview: the modifier reaches
+        # the receiver before the trigger reveals the chord, and the resync
+        # would re-send it even if that eager press were suppressed.
+        # TODO(jgruber): this drops the key on the remote entirely (no
+        # Super+Tab, no intentional overview on A). If we ever want the key
+        # usable there, replace this with a bare-key action chord (no modifier)
+        # or buffer the modifier press until chord resolution -- see the design
+        # discussion; the latter must also gate the resync path.
+        self._local_only_hid: set[int] = set()
+        for code in (local_only_evdev or []):
+            u = hid_map.encode_key(code)
+            if u is not None:
+                self._local_only_hid.add(u)
         # Strong references to fire-and-forget tasks (subprocess reapers).
         # asyncio only holds a weak reference to running tasks, so without
         # this a bare create_task() can be GC'd mid-flight; the done-callback
@@ -310,7 +327,7 @@ class SenderApp:
                 held_hid = set()
                 for code in active:
                     u = hid_map.encode_key(code)
-                    if u is not None:
+                    if u is not None and u not in self._local_only_hid:
                         held_hid.add(u)
                 src.held = set(held_hid)
             except OSError:
@@ -444,6 +461,11 @@ class SenderApp:
             u = hid_map.encode_key(event.code)
             if u is None:
                 return
+            # Local-only key: recorded in held_evdev above (so chords still
+            # match on it) but never forwarded and never added to the resync
+            # set. See _local_only_hid.
+            if u in self._local_only_hid:
+                return
             if not src.grabbed:
                 return
             if event.value == 1:
@@ -563,7 +585,7 @@ class SenderApp:
             return
         for code in active:
             u = hid_map.encode_key(code)
-            if u is None or u in self.toggle_chord_hid:
+            if u is None or u in self.toggle_chord_hid or u in self._local_only_hid:
                 continue
             src.held.add(u)
 
@@ -806,6 +828,16 @@ def main() -> int:
                              "source; while OFF the sender replies 'local' so "
                              "the client types it itself. Pairs with "
                              "dictate.py --emit-socket.")
+    parser.add_argument("--local-only", action="append", default=[],
+                        metavar="KEY",
+                        help="evdev key name that stays local: it still counts "
+                             "toward chord matching but is never forwarded to "
+                             "the receiver, nor included in the resync snapshot. "
+                             "Use to keep a bare-modifier chord's modifier (e.g. "
+                             "KEY_LEFTMETA for a Super+D action chord) from "
+                             "tapping the remote compositor's overview. Note: "
+                             "the key becomes unusable on the receiver. "
+                             "Repeatable.")
     parser.add_argument("--resync-interval", type=float,
                         default=DEFAULT_RESYNC_INTERVAL_S, metavar="SECONDS",
                         help="FULL_STATE / heartbeat cadence (default: "
@@ -852,6 +884,8 @@ def main() -> int:
         seen_triggers.add(trigger)
         action_chords.append((codes, cmd))
 
+    local_only = [_resolve_evdev_key(name) for name in args.local_only]
+
     # Default: SIGPIPE delivers BrokenPipeError on writes (not termination)
     # so the try/finally in run() can ungrab everything before exit.
     signal.signal(signal.SIGPIPE, signal.SIG_IGN)
@@ -864,6 +898,7 @@ def main() -> int:
         start_forwarding=not args.start_off,
         action_chords=action_chords,
         dictation_socket=args.dictation_socket,
+        local_only_evdev=local_only,
     )
     asyncio.run(_amain(app))
     return 0

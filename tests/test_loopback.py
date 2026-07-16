@@ -1060,6 +1060,92 @@ async def _action_chord() -> None:
     sender_out.close()
 
 
+def test_local_only_key_never_reaches_receiver():
+    """A --local-only key must be swallowed on the direct path AND kept out
+    of the FULL_STATE resync, even while physically held."""
+    asyncio.run(_local_only())
+
+
+async def _local_only() -> None:
+    src_kb = evdev.UInput(
+        {e.EV_KEY: [e.KEY_A, e.KEY_LEFTMETA]},
+        name="evpipe-test-localonly-src",
+        vendor=0xCAFE, product=0xBAB8,
+    )
+    await asyncio.sleep(0.2)
+
+    rfd, wfd = os.pipe()
+    sender_out = os.fdopen(wfd, "wb", buffering=0)
+    recv_in = os.fdopen(rfd, "rb", buffering=0)
+    loop = asyncio.get_running_loop()
+    reader = asyncio.StreamReader()
+    proto = asyncio.StreamReaderProtocol(reader)
+    await loop.connect_read_pipe(lambda: proto, recv_in)
+
+    sender = SenderApp(
+        [(src_kb.device.path, wire.DEV_KB)],
+        toggle_chord_evdev=[],
+        stdout=sender_out,
+        resync_interval_s=0.15,  # fast, so a leak would show as a re-press
+        start_forwarding=True,
+        local_only_evdev=[e.KEY_LEFTMETA],
+    )
+    receiver = ReceiverApp()
+    sender_task = asyncio.create_task(sender.run())
+    receiver_task = asyncio.create_task(receiver.run(reader))
+
+    for _ in range(40):
+        if receiver.uinputs:
+            break
+        await asyncio.sleep(0.05)
+    assert receiver.uinputs
+
+    recv_kb = evdev.InputDevice(receiver.uinputs[0].device.path)
+    out: list[evdev.InputEvent] = []
+
+    async def collect() -> None:
+        async for ev in recv_kb.async_read_loop():
+            out.append(ev)
+
+    collector = asyncio.create_task(collect())
+
+    # Hold Super, tap A while it is down, keep Super held across two resync
+    # intervals, then release. A must pass; Super must never appear.
+    src_kb.write(e.EV_KEY, e.KEY_LEFTMETA, 1); src_kb.syn()
+    src_kb.write(e.EV_KEY, e.KEY_A, 1); src_kb.syn()
+    src_kb.write(e.EV_KEY, e.KEY_A, 0); src_kb.syn()
+    await asyncio.sleep(0.4)  # >2 resync cycles with Super still held
+    src_kb.write(e.EV_KEY, e.KEY_LEFTMETA, 0); src_kb.syn()
+    await asyncio.sleep(0.2)
+
+    collector.cancel()
+    try:
+        await collector
+    except (asyncio.CancelledError, Exception):
+        pass
+
+    key_events = [(ev.code, ev.value) for ev in out if ev.type == e.EV_KEY]
+    meta_events = [ev for ev in key_events if ev[0] == e.KEY_LEFTMETA]
+    a_presses = [ev for ev in key_events if ev == (e.KEY_A, 1)]
+    assert not meta_events, f"KEY_LEFTMETA leaked to receiver: {key_events}"
+    assert len(a_presses) == 1, f"expected 1 KEY_A press, got: {key_events}"
+
+    sender.shutdown()
+    receiver.shutdown()
+    for t in (sender_task, receiver_task):
+        try:
+            await asyncio.wait_for(t, timeout=1.0)
+        except (asyncio.TimeoutError, Exception):
+            t.cancel()
+            try:
+                await t
+            except (asyncio.CancelledError, Exception):
+                pass
+    src_kb.close()
+    recv_kb.close()
+    sender_out.close()
+
+
 async def _drain(dev: evdev.InputDevice, window_s: float) -> list[evdev.InputEvent]:
     out: list[evdev.InputEvent] = []
 
