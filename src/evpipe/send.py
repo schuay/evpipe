@@ -140,6 +140,11 @@ class SenderApp:
                 continue
             self._action_by_trigger[codes[-1]] = (set(codes[:-1]), cmd)
         self.dictation_socket_path = dictation_socket
+        # Strong references to fire-and-forget tasks (subprocess reapers).
+        # asyncio only holds a weak reference to running tasks, so without
+        # this a bare create_task() can be GC'd mid-flight; the done-callback
+        # drops the entry once the task finishes.
+        self._background_tasks: set[asyncio.Task] = set()
         # Chord state. Empty list disables toggling (always-on).
         self.toggle_chord_evdev = list(toggle_chord_evdev)
         self.toggle_modifiers_evdev: set[int] = (
@@ -383,7 +388,14 @@ class SenderApp:
             return
         # Reap it in the background so it can't become a zombie, without
         # holding up the read loop.
-        asyncio.create_task(proc.wait())
+        self._spawn_background(proc.wait())
+
+    def _spawn_background(self, coro) -> None:
+        """Run a fire-and-forget coroutine, keeping a strong reference until
+        it completes so the event loop can't GC it mid-flight."""
+        task = asyncio.create_task(coro)
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
 
     async def _dispatch_event(self, src: Source, event: evdev.InputEvent) -> None:
         # A toggle is mid-flight: we have decided to flip but are holding the
