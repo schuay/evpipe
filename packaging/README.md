@@ -12,6 +12,34 @@ ssh $EVPIPE_SSH_OPTS $EVPIPE_SSH_TARGET "$EVPIPE_SEND_CMD $EVPIPE_SEND_ARGS" | $
 Everything on that line comes from `~/.config/evpipe/evpipe.conf`; the
 unit itself never needs editing.
 
+## Install the binaries
+
+Both hosts need evpipe installed: `evpipe-send` on B, `evpipe-recv` on
+A. From a checkout on each:
+
+```
+uv tool install .            # or --editable . to track the checkout
+```
+
+That puts both scripts in `~/.local/bin`, backed by their own venv. The
+unit adds `~/.local/bin` to `PATH` (systemd's own is a fixed
+`/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin`), so the receiver
+resolves by bare name.
+
+The sender does not get that help: `ssh hostb evpipe-send` runs a
+non-interactive shell, which on most distros skips the `~/.bashrc` that
+would add `~/.local/bin`. Check with
+
+```
+ssh hostb 'command -v evpipe-send'
+```
+
+and if it prints nothing, put the absolute path in `EVPIPE_SEND_CMD`.
+
+Staying with `uv sync` in a checkout instead of installing works too --
+point `EVPIPE_SEND_CMD`/`EVPIPE_RECV_CMD` at `uv run --project
+/path/to/evpipe evpipe-send` or at `/path/to/evpipe/.venv/bin/...`.
+
 ## Install (user service)
 
 ```

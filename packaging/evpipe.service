@@ -14,6 +14,9 @@ Environment=EVPIPE_SEND_CMD=evpipe-send
 Environment=EVPIPE_SEND_ARGS=
 Environment=EVPIPE_RECV_CMD=evpipe-recv
 Environment=EVPIPE_RECV_ARGS=
+# systemd's PATH is a fixed /usr/local/sbin:/usr/local/bin:/usr/sbin:
+# /usr/bin, which is not where `uv tool install` drops the scripts.
+Environment=PATH=%h/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
 EnvironmentFile=%h/.config/evpipe/evpipe.conf
 
 # $$ keeps systemd from expanding these; the shell does it instead, so

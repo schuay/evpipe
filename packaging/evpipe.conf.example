@@ -16,7 +16,10 @@ EVPIPE_SSH_TARGET=user@hostb
 EVPIPE_SSH_OPTS=-o BatchMode=yes -o ServerAliveInterval=5 -o ServerAliveCountMax=2
 
 # How to invoke the sender on the remote host. Plain `evpipe-send` needs
-# it on the non-interactive PATH there; for a uv checkout, spell it out:
+# it on the *non-interactive* PATH there, which usually excludes
+# ~/.local/bin -- check with `ssh hostb command -v evpipe-send` and if
+# that comes up empty, give the absolute path:
+#   EVPIPE_SEND_CMD=/home/user/.local/bin/evpipe-send
 #   EVPIPE_SEND_CMD=uv run --project /home/user/src/evpipe evpipe-send
 EVPIPE_SEND_CMD=evpipe-send
 
@@ -30,7 +33,9 @@ EVPIPE_SEND_ARGS=--kb /dev/input/by-id/usb-Keyboard-event-kbd --mouse /dev/input
 # only, never around the whole value:
 #   EVPIPE_SEND_ARGS=--kb /dev/input/by-id/... --action-chord 'KEY_LEFTMETA+KEY_D:echo toggle > $XDG_RUNTIME_DIR/dictate.fifo' --local-only KEY_LEFTMETA
 
-# Local receiver. Same story as EVPIPE_SEND_CMD for uv checkouts.
+# Local receiver. The unit puts ~/.local/bin on PATH, so a `uv tool
+# install` of evpipe is found by bare name; a checkout is not:
+#   EVPIPE_RECV_CMD=uv run --project /home/user/src/evpipe evpipe-recv
 EVPIPE_RECV_CMD=evpipe-recv
 EVPIPE_RECV_ARGS=
 
