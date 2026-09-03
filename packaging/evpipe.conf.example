@@ -1,0 +1,38 @@
+# evpipe.service configuration. Install to ~/.config/evpipe/evpipe.conf.
+#
+# Parsing is systemd's, not the shell's: no variable expansion happens
+# here, and a value that does *not* start with a quote keeps any quotes
+# it contains verbatim -- which is what lets the quoting below reach the
+# remote shell intact.
+
+# Where the keyboard/mouse physically live. Passed to ssh as-is, so a
+# ~/.ssh/config host alias works too.
+EVPIPE_SSH_TARGET=user@hostb
+
+# ssh options. The ServerAlive pair is what bounds how long a hung
+# network can hold the grab on the remote keyboard (~10s); drop it and
+# the user at the other end can be locked out indefinitely. BatchMode
+# keeps a key prompt from hanging the service forever.
+EVPIPE_SSH_OPTS=-o BatchMode=yes -o ServerAliveInterval=5 -o ServerAliveCountMax=2
+
+# How to invoke the sender on the remote host. Plain `evpipe-send` needs
+# it on the non-interactive PATH there; for a uv checkout, spell it out:
+#   EVPIPE_SEND_CMD=uv run --project /home/user/src/evpipe evpipe-send
+EVPIPE_SEND_CMD=evpipe-send
+
+# Sender arguments. This string is handed to the remote shell, so
+# by-id paths, quoting and $VARs all mean what they would if you had
+# typed them there. Prefer /dev/input/by-id over eventN: the numbers
+# get reshuffled by hotplug and reboots.
+EVPIPE_SEND_ARGS=--kb /dev/input/by-id/usb-Keyboard-event-kbd --mouse /dev/input/by-id/usb-Mouse-event-mouse --toggle-chord KEY_F10
+
+# An argument that contains spaces needs quotes around that argument
+# only, never around the whole value:
+#   EVPIPE_SEND_ARGS=--kb /dev/input/by-id/... --action-chord 'KEY_LEFTMETA+KEY_D:echo toggle > $XDG_RUNTIME_DIR/dictate.fifo' --local-only KEY_LEFTMETA
+
+# Local receiver. Same story as EVPIPE_SEND_CMD for uv checkouts.
+EVPIPE_RECV_CMD=evpipe-recv
+EVPIPE_RECV_ARGS=
+
+# Both ends log to the journal via stderr; --log-level=DEBUG on either
+# side shows chord matching and dropped events.

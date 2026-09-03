@@ -1,0 +1,37 @@
+[Unit]
+Description=evpipe: receive keyboard/mouse events forwarded over ssh
+Documentation=https://github.com/schuay/evpipe
+# No start rate limit: see Restart= below.
+StartLimitIntervalSec=0
+
+[Service]
+# Defaults. Anything the config file sets wins over these.
+# ServerAliveInterval/CountMax are not optional: without them a hung
+# network leaves the sender holding EVIOCGRAB on the remote keyboard.
+Environment="EVPIPE_SSH_OPTS=-o BatchMode=yes -o ServerAliveInterval=5 -o ServerAliveCountMax=2"
+Environment=EVPIPE_SSH_TARGET=
+Environment=EVPIPE_SEND_CMD=evpipe-send
+Environment=EVPIPE_SEND_ARGS=
+Environment=EVPIPE_RECV_CMD=evpipe-recv
+Environment=EVPIPE_RECV_ARGS=
+EnvironmentFile=%h/.config/evpipe/evpipe.conf
+
+# $$ keeps systemd from expanding these; the shell does it instead, so
+# quotes inside EVPIPE_SEND_ARGS survive to the remote shell verbatim.
+ExecStart=/bin/sh -c 'ssh $$EVPIPE_SSH_OPTS "$$EVPIPE_SSH_TARGET" "$$EVPIPE_SEND_CMD $$EVPIPE_SEND_ARGS" | $$EVPIPE_RECV_CMD $$EVPIPE_RECV_ARGS'
+
+# The link dying is the normal case, not a failure: the sender's host
+# reboots, the wifi drops, the laptop suspends. evpipe-recv exits 0 on
+# EOF, so on-failure would never fire. Retry forever, without a start
+# rate limit, so the link comes back on its own once the peer does.
+Restart=always
+RestartSec=5
+
+# Both ssh and evpipe-recv must die together. The default control-group
+# kill reaches both; closing the ssh connection makes sshd SIGHUP the
+# sender, which is one of its ungrab paths.
+KillMode=control-group
+TimeoutStopSec=10
+
+[Install]
+WantedBy=default.target

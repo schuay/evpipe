@@ -120,6 +120,12 @@ Anything outside the static `hid_map` table is dropped at the sender
 with a debug log line. EV_ABS (tablets, touchscreens) is reserved in
 the wire format but not yet wired in either direction.
 
+## Running it as a service
+
+`packaging/evpipe.service` is the ssh pipeline above wrapped in a
+systemd user unit, with the sender arguments in
+`~/.config/evpipe/evpipe.conf`. See `packaging/README.md`.
+
 ## Documents
 
 * `~/k/42-evpipe/start-here.md` -- project overview, next-tasks list.
