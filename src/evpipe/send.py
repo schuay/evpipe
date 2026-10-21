@@ -326,6 +326,8 @@ class SenderApp:
                 active = src.dev.active_keys()
                 held_hid = set()
                 for code in active:
+                    if code in src.swallow_release:
+                        continue
                     u = hid_map.encode_key(code)
                     if u is not None and u not in self._local_only_hid:
                         held_hid.add(u)

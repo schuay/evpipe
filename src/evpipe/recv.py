@@ -65,19 +65,26 @@ class ReceiverApp:
         try:
             for d in self.descriptors:
                 self._create_uinput(d)
-        except (OSError, evdev.UInputError) as exc:
+        except (OSError, evdev.UInputError, wire.ProtocolError) as exc:
             logger.error("uinput create failed: %s", exc)
-            self._teardown()
+            await self._teardown()
             return 1
         logger.info("session open: %d virtual device(s)", len(self.uinputs))
 
         self._last_packet = time.monotonic()
+        tasks = [
+            asyncio.create_task(self._read_loop(reader)),
+            asyncio.create_task(self._heartbeat_loop()),
+            asyncio.create_task(self.shutting_down.wait()),
+        ]
         try:
-            await asyncio.gather(
-                self._read_loop(reader),
-                self._heartbeat_loop(),
-            )
+            done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+            for task in done:
+                task.result()
         finally:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
             await self._teardown()
         return 0
 
