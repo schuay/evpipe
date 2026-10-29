@@ -12,7 +12,13 @@
     grabbed.
   * A periodic resync coroutine emits FULL_STATE for every source on a
     fixed interval. That same packet doubles as a heartbeat -- the
-    receiver treats absence as link death.
+    receiver treats absence as link death. The same tick also checks
+    whether this host just woke from suspend; if so the session is
+    presumed dead and the sender exits rather than hold the grab until
+    TCP times out.
+  * The link is one-way: nothing tells the sender its peer is gone
+    until sshd notices. So a new sender evicts any previous one on the
+    host (see senderlock.py) instead of sharing the devices with it.
 
 Teardown contract:
   every grabbed device gets ungrabbed before exit, no matter how we
@@ -25,6 +31,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import errno
 import json
 import logging
 import os
@@ -32,17 +39,45 @@ import signal
 import sys
 import time
 from dataclasses import dataclass, field
-from typing import BinaryIO, Optional
+from typing import BinaryIO, Callable, Optional
 
 import evdev
 import evdev.ecodes as e
 
-from . import hid_map, wire
+from . import hid_map, senderlock, wire
 
 logger = logging.getLogger("evpipe-send")
 
 DEFAULT_RESYNC_INTERVAL_S = 0.5
 DEFAULT_TOGGLE_CHORD = ["KEY_F10"]
+# A suspend longer than this means the peer's ssh has given up on us
+# (ServerAliveInterval=5 x CountMax=2 in the shipped unit), so the
+# session is dead and the sender exits. Shorter naps may survive the
+# link and are left alone.
+SUSPEND_EXIT_THRESHOLD_S = 10.0
+
+
+class SuspendDetector:
+    """Measure how long the host slept between two calls to `slept()`.
+
+    CLOCK_BOOTTIME keeps counting through suspend, CLOCK_MONOTONIC does
+    not, so the difference in their advance is time spent asleep. Clocks
+    are injectable for tests.
+    """
+
+    def __init__(self, monotonic: Callable[[], float] = time.monotonic,
+                 boottime: Optional[Callable[[], float]] = None) -> None:
+        self._monotonic = monotonic
+        self._boottime = boottime or (
+            lambda: time.clock_gettime(time.CLOCK_BOOTTIME))
+        self._last_mono = self._monotonic()
+        self._last_boot = self._boottime()
+
+    def slept(self) -> float:
+        mono, boot = self._monotonic(), self._boottime()
+        asleep = (boot - self._last_boot) - (mono - self._last_mono)
+        self._last_mono, self._last_boot = mono, boot
+        return max(0.0, asleep)
 
 
 @dataclass
@@ -118,10 +153,14 @@ class SenderApp:
         action_chords: Optional[list[tuple[list[int], str]]] = None,
         dictation_socket: Optional[str] = None,
         local_only_evdev: Optional[list[int]] = None,
+        suspend_exit_threshold_s: float = SUSPEND_EXIT_THRESHOLD_S,
+        suspend_detector: Optional[SuspendDetector] = None,
     ) -> None:
         self.source_paths = source_paths
         self.stdout = stdout
         self.resync_interval_s = resync_interval_s
+        self.suspend_exit_threshold_s = suspend_exit_threshold_s
+        self.suspend_detector = suspend_detector
         self.forwarding_on = start_forwarding
         self.sources: list[Source] = []
         self.shutting_down = asyncio.Event()
@@ -198,8 +237,8 @@ class SenderApp:
             self._teardown()
             return
         if self.forwarding_on:
-            self._grab_all()
-            logger.info("forwarding ON at startup")
+            if self._grab_all():
+                logger.info("forwarding ON at startup")
 
         tasks: list[asyncio.Task] = []
         for src in self.sources:
@@ -253,7 +292,15 @@ class SenderApp:
         descs = [s.descriptor for s in self.sources]
         wire.write_session_open(self.stdout, descs)
 
-    def _grab_all(self) -> None:
+    def _grab_all(self) -> bool:
+        """Grab every source. Returns False if any grab failed.
+
+        A failure is not fatal: exiting would only loop under the
+        receiver's Restart=always while the competitor lives. But it is
+        an error, and the callers must not report a grab that didn't
+        happen.
+        """
+        ok = True
         for src in self.sources:
             if src.grabbed:
                 continue
@@ -261,7 +308,11 @@ class SenderApp:
                 src.dev.grab()
                 src.grabbed = True
             except OSError as exc:
-                logger.warning("grab failed on %s: %s", src.path, exc)
+                ok = False
+                hint = (" (another process holds the grab)"
+                        if exc.errno == errno.EBUSY else "")
+                logger.error("grab failed on %s: %s%s", src.path, exc, hint)
+        return ok
 
     def _ungrab_all(self) -> None:
         for src in self.sources:
@@ -565,12 +616,13 @@ class SenderApp:
         """
         if self._pending_grab:
             self._pending_grab = False
-            self._grab_all()
+            grabbed = self._grab_all()
             self.forwarding_on = True
             for src in self.sources:
                 self._seed_held_from_kernel(src)
                 await self._emit_full_state(src)
-            logger.debug("chord released; grabbed, forwarding ON")
+            if grabbed:
+                logger.debug("chord released; grabbed, forwarding ON")
         else:
             self._ungrab_all()
             logger.debug("trigger released; ungrabbed")
@@ -707,6 +759,7 @@ class SenderApp:
         return wire.encode_packet(wire.PACKET_EVENT, wire.encode_event(ev))
 
     async def _resync_loop(self) -> None:
+        suspend = self.suspend_detector or SuspendDetector()
         while not self.shutting_down.is_set():
             try:
                 await asyncio.wait_for(
@@ -715,6 +768,12 @@ class SenderApp:
                 return
             except asyncio.TimeoutError:
                 pass
+            slept = suspend.slept()
+            if slept > self.suspend_exit_threshold_s:
+                logger.warning("host suspended for ~%.0fs; session presumed "
+                               "dead, exiting", slept)
+                self.shutdown()
+                return
             for src in self.sources:
                 await self._emit_full_state(src)
 
@@ -847,6 +906,13 @@ def main() -> int:
     parser.add_argument("--start-off", action="store_true",
                         help="start with forwarding OFF; press the toggle chord "
                              "to enable. Pairs with --toggle-chord.")
+    parser.add_argument("--lock-file", metavar="PATH",
+                        default=senderlock.default_lock_path(),
+                        help="lock that makes this the only sender on the host: "
+                             "a previous holder is evicted before the devices "
+                             "are opened. Pass an empty string to run without "
+                             "one. Default: $XDG_RUNTIME_DIR/"
+                             + senderlock.LOCK_FILE_NAME + ".")
     parser.add_argument("--log-level", default="INFO",
                         choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     parser.add_argument("--list-devices", action="store_true",
@@ -891,6 +957,17 @@ def main() -> int:
     # Default: SIGPIPE delivers BrokenPipeError on writes (not termination)
     # so the try/finally in run() can ungrab everything before exit.
     signal.signal(signal.SIGPIPE, signal.SIG_IGN)
+
+    # Before any device is opened: a stale sender from a dead session may
+    # still hold the grab. The fd is deliberately never closed: the lock
+    # lives exactly as long as the process.
+    if args.lock_file:
+        try:
+            lock_fd = senderlock.acquire(args.lock_file)
+        except senderlock.LockError as exc:
+            logger.error("%s", exc)
+            return 1
+        del lock_fd
 
     app = SenderApp(
         sources,

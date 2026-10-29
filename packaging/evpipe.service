@@ -6,8 +6,9 @@ StartLimitIntervalSec=0
 
 [Service]
 # Defaults. Anything the config file sets wins over these.
-# ServerAliveInterval/CountMax are not optional: without them a hung
-# network leaves the sender holding EVIOCGRAB on the remote keyboard.
+# ServerAliveInterval/CountMax make this end drop a stalled link in
+# ~10s. They do not reach the sender: it bounds its own lifetime with
+# a per-host lock (a new session evicts it) and a suspend check.
 Environment="EVPIPE_SSH_OPTS=-o BatchMode=yes -o ServerAliveInterval=5 -o ServerAliveCountMax=2"
 Environment=EVPIPE_SSH_TARGET=
 Environment=EVPIPE_SEND_CMD=evpipe-send

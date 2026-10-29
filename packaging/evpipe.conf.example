@@ -9,9 +9,9 @@
 # ~/.ssh/config host alias works too.
 EVPIPE_SSH_TARGET=user@hostb
 
-# ssh options. The ServerAlive pair is what bounds how long a hung
-# network can hold the grab on the remote keyboard (~10s); drop it and
-# the user at the other end can be locked out indefinitely. BatchMode
+# ssh options. The ServerAlive pair makes this end give up on a stalled
+# link in ~10s instead of waiting for TCP; the sender on the other end
+# is bounded separately by its own lock and suspend check. BatchMode
 # keeps a key prompt from hanging the service forever.
 EVPIPE_SSH_OPTS=-o BatchMode=yes -o ServerAliveInterval=5 -o ServerAliveCountMax=2
 

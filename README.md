@@ -39,12 +39,21 @@ ssh -o ServerAliveInterval=5 -o ServerAliveCountMax=2 \
   | evpipe-recv
 ```
 
-`ServerAliveInterval=5 ServerAliveCountMax=2` is the load-bearing
-piece: without it, a hung network leaves the sender holding `EVIOCGRAB`
-on B's keyboard, which means the user at B can't type until the TCP
-stack notices. With it, ssh tears down within ~10s on a stall, the
-sender gets `SIGPIPE` -> ungrab path, and B's keyboard returns to the
-local compositor.
+`ServerAliveInterval=5 ServerAliveCountMax=2` makes A's ssh give up on
+a stalled link within ~10s instead of waiting for TCP. It frees A, not
+B: the sender on B only learns the session is dead when sshd there
+notices, which on a half-open connection takes ~15 minutes. Two things
+in the sender bound that instead:
+
+* **Newest sender wins.** On start, `evpipe-send` takes an flock on
+  `$XDG_RUNTIME_DIR/evpipe-send.lock` (`--lock-file` to change or
+  disable). A previous holder is sent `SIGTERM` (its ungrab path), then
+  `SIGKILL` if it does not go within 2s; the kernel releases the grab
+  when the fd closes. So reconnecting after a dead session never shares
+  B's keyboard with the stale sender. One sender per user per host.
+* **Exit on suspend.** If B itself slept for longer than ~10s, the
+  session is presumed dead and the sender exits on resume rather than
+  hold the grab until TCP times out.
 
 ## Toggle hotkey
 

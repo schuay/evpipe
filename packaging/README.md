@@ -77,6 +77,12 @@ exits 0 on EOF, so `on-failure` would never fire. The service retries
 every 5s until B answers again. Stopping the service kills ssh, which
 makes sshd send `SIGHUP` to the sender on B, which releases its grabs.
 
+If B never got that `SIGHUP` (it was asleep, or the network was gone),
+its old sender lingers under sshd until TCP gives up. The next session's
+sender evicts it via the lock in `$XDG_RUNTIME_DIR`, and a sender whose
+host slept for more than ~10s exits by itself on resume; see the
+top-level README.
+
 The cost is that a genuinely broken config (wrong host, bad path) also
 retries forever rather than failing loudly. `journalctl --user -u
 evpipe` shows ssh's and the receiver's stderr.
