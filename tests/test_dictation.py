@@ -120,6 +120,10 @@ def test_dictation_target_prefers_keyboard():
 
 
 def _run_client(app: SenderApp, text: str, submit: bool = False):
+    return _run_raw(app, (json.dumps({"text": text, "submit": submit}) + "\n").encode())
+
+
+def _run_raw(app: SenderApp, request: bytes):
     """Drive _handle_dictation_client with an in-memory reader/writer pair."""
     written = bytearray()
 
@@ -135,8 +139,7 @@ def _run_client(app: SenderApp, text: str, submit: bool = False):
 
     async def go():
         reader = asyncio.StreamReader()
-        reader.feed_data(
-            (json.dumps({"text": text, "submit": submit}) + "\n").encode())
+        reader.feed_data(request)
         reader.feed_eof()
         await app._handle_dictation_client(reader, _W())
 
@@ -160,3 +163,22 @@ def test_routing_local_when_not_forwarding():
     reply = _run_client(app, "hi")
     assert reply == {"routed": "local"}
     assert out.getvalue() == b""  # nothing injected locally
+
+
+@pytest.mark.parametrize("request_line", [
+    b"",
+    b"not json\n",
+    b"\xff\xfe\n",
+    b"[]\n",
+    b'{"submit": true}\n',
+    b'{"text": 5}\n',
+    b'{"text": ["a"]}\n',
+    b'{"text": "' + b"a" * 70000 + b'"}\n',
+], ids=["empty", "not-json", "not-utf8", "not-an-object", "no-text",
+        "text-number", "text-list", "line-too-long"])
+def test_malformed_request_is_answered_local(request_line):
+    out = io.BytesIO()
+    app = _make_app(out, forwarding=True)
+    app.sources = [_FakeSource(device_id=0, role=wire.DEV_KB)]
+    assert _run_raw(app, request_line) == {"routed": "local"}
+    assert out.getvalue() == b""

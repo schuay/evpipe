@@ -746,13 +746,12 @@ class SenderApp:
         paragraph out.
         """
         try:
-            raw = await reader.readline()
             try:
-                msg = json.loads(raw.decode("utf-8"))
-                text = msg.get("text", "")
-                submit = bool(msg.get("submit", False))
-            except (ValueError, AttributeError):
-                text, submit = "", False
+                raw = await reader.readline()
+            except ValueError:
+                # The line exceeds the stream's buffer limit.
+                raw = b""
+            text, submit = _parse_dictation_request(raw)
             routed = "local"
             if text and self.forwarding_on:
                 await self._inject_text(text, submit)
@@ -840,6 +839,21 @@ class SenderApp:
         await self._expire_lost_releases()
         for src in self.sources:
             await self._emit_full_state(src)
+
+
+def _parse_dictation_request(raw: bytes) -> tuple[str, bool]:
+    """(text, submit) from one request line.
+
+    Anything other than a JSON object with a string "text" yields empty
+    text, which the handler answers "local".
+    """
+    try:
+        msg = json.loads(raw)
+    except ValueError:
+        return "", False
+    if not isinstance(msg, dict) or not isinstance(msg.get("text"), str):
+        return "", False
+    return msg["text"], bool(msg.get("submit", False))
 
 
 def _resolve_evdev_key(name: str) -> int:
