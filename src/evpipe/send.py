@@ -18,7 +18,8 @@
     TCP times out.
   * The link is one-way: nothing tells the sender its peer is gone
     until sshd notices. So a new sender evicts any previous one on the
-    host (see senderlock.py) instead of sharing the devices with it.
+    host (see senderlock.py) instead of sharing the devices with it,
+    and a sender whose output stops draining exits.
 
 Teardown contract:
   every grabbed device gets ungrabbed before exit, no matter how we
@@ -232,10 +233,8 @@ class SenderApp:
 
     async def run(self) -> None:
         self._open_sources()
-        try:
-            self._write_session_open()
-        except (BrokenPipeError, OSError) as exc:
-            logger.error("downstream closed before session_open: %s", exc)
+        descriptors = [s.descriptor for s in self.sources]
+        if not self._write_bytes(wire.encode_session_open(descriptors)):
             self._teardown()
             return
         if self.forwarding_on:
@@ -292,10 +291,6 @@ class SenderApp:
             logger.info("source %d: %s (%s) keys=%d rels=%d",
                         idx, path, dev.name, len(desc.keys), len(desc.rel_axes))
 
-    def _write_session_open(self) -> None:
-        descs = [s.descriptor for s in self.sources]
-        wire.write_session_open(self.stdout, descs)
-
     def _grab_all(self) -> bool:
         """Grab every source. Returns False if any grab failed.
 
@@ -337,19 +332,35 @@ class SenderApp:
                 pass
 
     def _write_bytes(self, data: bytes) -> bool:
-        """Synchronous write to stdout; returns False on BrokenPipeError.
+        """Write whole frames to stdout; False if the link is gone.
 
-        The lock is held only during a single write so concurrent source
-        readers can't interleave bytes mid-frame.
+        stdout is non-blocking (see main()), so a link that has stopped
+        draining fails the write instead of blocking the event loop in it.
+        Blocked, the sender could neither see the toggle chord nor act on
+        SIGTERM while still holding the grab. Input is real time: once the
+        output buffer is full the backlog is worthless and the session is
+        treated as dead.
+
+        Nothing is written once shutdown has begun, so a short write is
+        never followed by bytes the receiver would parse out of frame.
         """
+        if self.shutting_down.is_set():
+            return False
         try:
-            self.stdout.write(data)
+            written = self.stdout.write(data)
             self.stdout.flush()
-            return True
-        except (BrokenPipeError, OSError) as exc:
+        except BlockingIOError:
+            written = None
+        except OSError as exc:
             logger.info("downstream closed (%s); shutting down", exc)
             self.shutting_down.set()
             return False
+        if written != len(data):
+            logger.warning("downstream stalled (output buffer full); "
+                           "session presumed dead, shutting down")
+            self.shutting_down.set()
+            return False
+        return True
 
     async def _emit_event(self, ev_kind: int, code: int, value: int, device_id: int) -> None:
         data = self._event_bytes(ev_kind, code, value, device_id)
@@ -935,6 +946,11 @@ def main() -> int:
     if args.list_devices:
         return list_input_devices()
 
+    # stdout is made non-blocking below. That flag lives on the open file
+    # description, which a terminal shares with the shell that started us.
+    if sys.stdout.isatty():
+        parser.error("stdout is a terminal; pipe it into evpipe-recv")
+
     sources: list[tuple[str, int]] = []
     for p in args.kb:
         sources.append((p, wire.DEV_KB))
@@ -976,10 +992,15 @@ def main() -> int:
             return 1
         del lock_fd
 
+    # Unbuffered and non-blocking, so a stalled link shows up as a failed
+    # write; see SenderApp._write_bytes.
+    stdout = sys.stdout.buffer.raw
+    os.set_blocking(stdout.fileno(), False)
+
     app = SenderApp(
         sources,
         toggle_chord_evdev=toggle_chord,
-        stdout=sys.stdout.buffer,
+        stdout=stdout,
         resync_interval_s=args.resync_interval,
         start_forwarding=not args.start_off,
         action_chords=action_chords,

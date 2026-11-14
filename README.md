@@ -42,8 +42,8 @@ ssh -o ServerAliveInterval=5 -o ServerAliveCountMax=2 \
 `ServerAliveInterval=5 ServerAliveCountMax=2` makes A's ssh give up on
 a stalled link within ~10s instead of waiting for TCP. It frees A, not
 B: the sender on B only learns the session is dead when sshd there
-notices, which on a half-open connection takes ~15 minutes. Two things
-in the sender bound that instead:
+notices, which on a half-open connection takes ~15 minutes. Three
+things in the sender bound that instead:
 
 * **Newest sender wins.** On start, `evpipe-send` takes an flock on
   `$XDG_RUNTIME_DIR/evpipe-send.lock` (`--lock-file` to change or
@@ -54,6 +54,11 @@ in the sender bound that instead:
 * **Exit on suspend.** If B itself slept for longer than ~10s, the
   session is presumed dead and the sender exits on resume rather than
   hold the grab until TCP times out.
+* **Exit on stalled output.** The sender never blocks on its stdout.
+  If sshd stops draining it and the buffers in between fill up, the
+  sender exits. Until then the toggle chord keeps working, so B's
+  keyboard is never stuck behind a dead link. This is a backstop, not a
+  detector: with little traffic the buffers take a long time to fill.
 
 ## Toggle hotkey
 
