@@ -10,6 +10,7 @@ import subprocess
 import sys
 
 import evdev.ecodes as e
+import pytest
 
 from .fakes import FakeInputDevice, SenderHarness, async_test
 
@@ -80,7 +81,7 @@ def test_sender_process_exits_when_nothing_drains_its_stdout():
         except subprocess.TimeoutExpired:
             proc.kill()
             _, stderr = proc.communicate()
-            raise AssertionError(f"sender blocked on its stdout:\n{stderr}")
+            pytest.fail(f"sender blocked on its stdout:\n{stderr}")
         assert proc.returncode == 0, stderr
         assert "stalled" in stderr
         assert "exit rc=0 grabbed=False" in stderr

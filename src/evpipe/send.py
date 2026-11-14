@@ -1031,7 +1031,7 @@ def main() -> int:
 
     # Unbuffered and non-blocking, so a stalled link shows up as a failed
     # write; see SenderApp._write_bytes.
-    stdout = sys.stdout.buffer.raw
+    stdout = os.fdopen(sys.stdout.fileno(), "wb", buffering=0, closefd=False)
     os.set_blocking(stdout.fileno(), False)
 
     app = SenderApp(
