@@ -28,7 +28,7 @@ import logging
 import signal
 import sys
 import time
-from typing import Optional
+from typing import Callable
 
 import evdev
 import evdev.ecodes as e
@@ -44,7 +44,8 @@ UINPUT_NAME_PREFIX = "evpipe: "
 
 
 class ReceiverApp:
-    def __init__(self) -> None:
+    def __init__(self, make_uinput: Callable[..., evdev.UInput] = evdev.UInput) -> None:
+        self._make_uinput = make_uinput
         self.uinputs: list[evdev.UInput] = []
         self.descriptors: list[wire.DeviceDescriptor] = []
         # Held HID wire codes per source device_id. Authoritative for the
@@ -108,7 +109,7 @@ class ReceiverApp:
             raise wire.ProtocolError(
                 f"descriptor for {d.name!r} has no usable keys/rels"
             )
-        ui = evdev.UInput(
+        ui = self._make_uinput(
             caps,
             name=f"{UINPUT_NAME_PREFIX}{d.name}",
             vendor=d.vendor_id,

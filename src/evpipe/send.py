@@ -155,8 +155,10 @@ class SenderApp:
         local_only_evdev: Optional[list[int]] = None,
         suspend_exit_threshold_s: float = SUSPEND_EXIT_THRESHOLD_S,
         suspend_detector: Optional[SuspendDetector] = None,
+        open_device: Callable[[str], evdev.InputDevice] = evdev.InputDevice,
     ) -> None:
         self.source_paths = source_paths
+        self._open_device = open_device
         self.stdout = stdout
         self.resync_interval_s = resync_interval_s
         self.suspend_exit_threshold_s = suspend_exit_threshold_s
@@ -275,7 +277,7 @@ class SenderApp:
 
     def _open_sources(self) -> None:
         for idx, (path, role) in enumerate(self.source_paths):
-            dev = evdev.InputDevice(path)
+            dev = self._open_device(path)
             desc = _build_descriptor(dev, role)
             try:
                 initial_held = set(dev.active_keys())
@@ -774,8 +776,11 @@ class SenderApp:
                                "dead, exiting", slept)
                 self.shutdown()
                 return
-            for src in self.sources:
-                await self._emit_full_state(src)
+            await self._resync()
+
+    async def _resync(self) -> None:
+        for src in self.sources:
+            await self._emit_full_state(src)
 
 
 def _resolve_evdev_key(name: str) -> int:
