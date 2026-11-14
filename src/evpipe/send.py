@@ -182,7 +182,8 @@ class SenderApp:
             if not codes:
                 continue
             self._action_by_trigger[codes[-1]] = (set(codes[:-1]), cmd)
-        self.dictation_socket_path = dictation_socket
+        # Empty when there is no dictation socket.
+        self.dictation_socket_path: str = dictation_socket or ""
         # Keys that update chord state but are never forwarded to the receiver,
         # nor included in the FULL_STATE resync snapshot. Used to keep a
         # modifier (e.g. LEFTMETA) out of a bare-modifier chord like Super+D
@@ -525,7 +526,7 @@ class SenderApp:
             if self._chord_fires(src, event.code, event.value):
                 # The trigger never reaches the receiver, and never makes
                 # it into held_evdev either.
-                await self._toggle()
+                await self._toggle(event.code)
                 return
             cmd = self._action_command(src, event.code, event.value)
             if cmd is not None:
@@ -570,7 +571,8 @@ class SenderApp:
             await self._emit_event(wire.EV_SYN, 0, 0, src.device_id)
         # EV_ABS, EV_MSC, EV_LED, etc. dropped for v1.
 
-    async def _toggle(self) -> None:
+    async def _toggle(self, trigger: int) -> None:
+        """Flip forwarding. `trigger` is the chord key whose press fired."""
         if self._toggle_pending:
             return
         self._toggle_pending = True
@@ -585,22 +587,16 @@ class SenderApp:
                 self.forwarding_on = False
                 for src in self.sources:
                     await self._emit_full_state(src)
-                if self.toggle_trigger_evdev is not None:
-                    # Hold the grab until the trigger is released; ungrabbing
-                    # with it still down makes the kernel synthesise a held-
-                    # trigger press to B's compositor. We wait on the trigger
-                    # alone -- a still-held modifier self-heals at ungrab (the
-                    # compositor is live again to receive its release), and
-                    # waiting on it could keep B's keyboard grabbed for as long
-                    # as the user chooses to hold it.
-                    self._begin_deferred_toggle(
-                        grab_on_complete=False,
-                        pending={self.toggle_trigger_evdev},
-                    )
-                    logger.info("forwarding OFF (waiting for trigger release to ungrab)")
-                else:
-                    self._ungrab_all()
-                    logger.info("forwarding OFF")
+                # Hold the grab until the trigger is released; ungrabbing
+                # with it still down makes the kernel synthesise a held-
+                # trigger press to B's compositor. We wait on the trigger
+                # alone -- a still-held modifier self-heals at ungrab (the
+                # compositor is live again to receive its release), and
+                # waiting on it could keep B's keyboard grabbed for as long
+                # as the user chooses to hold it.
+                self._begin_deferred_toggle(
+                    grab_on_complete=False, pending={trigger})
+                logger.info("forwarding OFF (waiting for trigger release to ungrab)")
             else:
                 # OFF -> ON. Defer the grab until every key/button currently
                 # held is released -- not just the chord. While off we are
@@ -614,7 +610,7 @@ class SenderApp:
                 # Cost: holding the chord (or a drag) delays the grab until you
                 # let go, but B stays usable locally in the meantime.
                 pending = self._active_keys()
-                pending.add(self.toggle_trigger_evdev)
+                pending.add(trigger)
                 self._begin_deferred_toggle(grab_on_complete=True, pending=pending)
                 logger.info("forwarding ON (waiting for held keys to release to grab)")
         finally:
