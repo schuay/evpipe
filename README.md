@@ -144,8 +144,3 @@ the wire format but not yet wired in either direction.
 `packaging/evpipe.service` is the ssh pipeline above wrapped in a
 systemd user unit, with the sender arguments in
 `~/.config/evpipe/evpipe.conf`. See `packaging/README.md`.
-
-## Documents
-
-* `~/k/42-evpipe/start-here.md` -- project overview, next-tasks list.
-* `~/k/42-evpipe/design.md` -- full architecture, wire format, teardown.
