@@ -28,7 +28,7 @@ async def test_keys_are_forwarded_in_order_and_grab_is_released_on_exit():
         kb.tap(A)
         kb.release(SHIFT)
         await h.settle()
-        assert h.packets() == [
+        assert await h.packets() == [
             ("key", SHIFT, 1), ("syn",),
             ("key", A, 1), ("syn",),
             ("key", A, 0), ("syn",),
@@ -44,7 +44,7 @@ async def test_relative_motion_is_forwarded():
     async with SenderHarness(mouse) as h:
         mouse.rel(e.REL_X, -3)
         await h.settle()
-        assert h.packets() == [("rel", e.REL_X, -3), ("syn",)]
+        assert await h.packets() == [("rel", e.REL_X, -3), ("syn",)]
 
 
 @async_test
@@ -54,7 +54,7 @@ async def test_unmapped_key_is_dropped():
         kb.tap(e.KEY_FN)
         kb.tap(A)
         await h.settle()
-        assert h.key_events() == [(A, 1), (A, 0)]
+        assert await h.key_events() == [(A, 1), (A, 0)]
 
 
 @async_test
@@ -67,7 +67,7 @@ async def test_resync_reports_held_keys():
         kb.release(A)
         await h.settle()
         await h.app._resync()
-        assert h.full_states() == [[A], []]
+        assert await h.full_states() == [[A], []]
 
 
 @async_test
@@ -86,7 +86,7 @@ async def test_single_key_chord_toggles_and_is_never_forwarded():
         assert kb.grabbed
         kb.tap(A)
         await h.settle()
-        assert h.key_events() == [(A, 1), (A, 0), (A, 1), (A, 0)]
+        assert await h.key_events() == [(A, 1), (A, 0), (A, 1), (A, 0)]
 
 
 @async_test
@@ -96,7 +96,7 @@ async def test_chord_needs_its_modifiers():
         kb.tap(F12)  # no modifier: an ordinary key
         await h.settle()
         assert h.app.forwarding_on is True
-        assert h.key_events() == [(F12, 1), (F12, 0)]
+        assert await h.key_events() == [(F12, 1), (F12, 0)]
 
         kb.press(CTRL)
         kb.tap(F12)
@@ -105,8 +105,8 @@ async def test_chord_needs_its_modifiers():
         assert h.app.forwarding_on is False
         # The modifier went out before the trigger revealed the chord; the
         # FULL_STATE sent at the flip releases it on the receiver.
-        assert h.key_events() == [(F12, 1), (F12, 0), (CTRL, 1)]
-        assert h.full_states() == [[]]
+        assert await h.key_events() == [(F12, 1), (F12, 0), (CTRL, 1)]
+        assert await h.full_states() == [[]]
 
 
 @async_test
@@ -122,9 +122,9 @@ async def test_chord_off_keeps_trigger_released_while_it_is_held():
         kb.release(F10)
         await h.settle()
         await h.app._resync()
-        assert h.key_events() == []
-        assert all(held == [] for held in h.full_states())
-        assert len(h.full_states()) == 3
+        assert await h.key_events() == []
+        assert all(held == [] for held in await h.full_states())
+        assert len(await h.full_states()) == 3
 
 
 @async_test
@@ -161,7 +161,7 @@ async def test_chord_on_defers_grab_until_chord_released():
         assert kb.grabbed
         assert h.app.forwarding_on is True
         assert kb.seen_by_others == [(CTRL, 1), (F12, 1), (F12, 0), (CTRL, 0)]
-        assert h.key_events() == []
+        assert await h.key_events() == []
 
 
 @async_test
@@ -179,7 +179,7 @@ async def test_chord_on_defers_grab_until_held_button_released():
         assert kb.grabbed
         assert h.app.forwarding_on is True
         assert (BTN, 0) in kb.seen_by_others
-        assert h.key_events() == []
+        assert await h.key_events() == []
 
 
 @async_test
@@ -203,7 +203,7 @@ async def test_action_chord_fires_only_while_grabbed_and_eats_trigger(tmp_path):
         kb.tap(F10)  # forwarding OFF: the key belongs to the compositor
         kb.tap(F9)
         assert await fired() == 2
-        assert h.key_events() == []
+        assert await h.key_events() == []
 
 
 @async_test
@@ -223,8 +223,8 @@ async def test_local_only_key_matches_chords_but_never_reaches_the_wire(tmp_path
         await h.settle()
         await asyncio.gather(*h.app._background_tasks)
         assert marker.read_text() == "fired\n"
-        assert h.key_events() == [(A, 1), (A, 0)]
-        assert h.full_states() == [[]]
+        assert await h.key_events() == [(A, 1), (A, 0)]
+        assert await h.full_states() == [[]]
 
 
 @async_test
@@ -249,7 +249,7 @@ async def test_lost_trigger_release_does_not_keep_the_grab():
         assert kb.grabbed
         kb.tap(A)
         await h.settle()
-        assert h.key_events() == [(A, 1), (A, 0)]
+        assert await h.key_events() == [(A, 1), (A, 0)]
 
 
 @async_test
@@ -271,7 +271,7 @@ async def test_lost_release_does_not_block_switching_on():
         kb.tap(F12)
         await h.settle()
         assert h.app.forwarding_on is True
-        assert h.key_events() == [(F12, 1), (F12, 0)]
+        assert await h.key_events() == [(F12, 1), (F12, 0)]
 
 
 @async_test
@@ -311,7 +311,7 @@ async def test_action_trigger_released_during_a_toggle_fires_again(tmp_path):
         await h.settle()
         await asyncio.gather(*h.app._background_tasks)
         assert marker.read_text() == "fired\nfired\n"
-        assert h.key_events() == []
+        assert await h.key_events() == []
 
 
 @async_test
@@ -350,8 +350,8 @@ async def test_startup_defers_grab_while_a_key_is_held():
         assert kb.seen_by_others == [(ENTER, 0)]
         kb.tap(A)
         await h.settle()
-        assert h.key_events() == [(A, 1), (A, 0)]
-        assert all(held == [] for held in h.full_states())
+        assert await h.key_events() == [(A, 1), (A, 0)]
+        assert all(held == [] for held in await h.full_states())
 
 
 @async_test
@@ -364,4 +364,4 @@ async def test_start_off_does_not_grab():
         await h.settle()
         assert not kb.grabbed
         assert h.app.forwarding_on is False
-        assert h.key_events() == []
+        assert await h.key_events() == []

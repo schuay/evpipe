@@ -891,7 +891,7 @@ async def _safety_release_recovers() -> None:
             kind=wire.DEV_KB,
             keys=[(hid_map.HID_PAGE_KEYBOARD << 8) | 0x04],  # KEY_A
         )
-        wire.write_session_open(wstream, [descriptor])
+        wstream.write(wire.encode_session_open([descriptor]))
 
         receiver = ReceiverApp()
         receiver_task = asyncio.create_task(receiver.run(reader))
@@ -905,8 +905,9 @@ async def _safety_release_recovers() -> None:
         hid_a = (hid_map.HID_PAGE_KEYBOARD << 8) | 0x04
 
         # Phase 1: press KEY_A. Receiver should track it as held.
-        wire.write_event(wstream, wire.Event(wire.EV_KEY, hid_a, 1, 0, 0))
-        wire.write_event(wstream, wire.Event(wire.EV_SYN, 0, 0, 0, 0))
+        for ev in (wire.Event(wire.EV_KEY, hid_a, 1, 0, 0),
+                   wire.Event(wire.EV_SYN, 0, 0, 0, 0)):
+            wstream.write(wire.encode_packet(wire.PACKET_EVENT, wire.encode_event(ev)))
         await asyncio.sleep(0.1)
         assert hid_a in receiver.held_per_dev[0], (
             f"press not registered: {receiver.held_per_dev[0]}"
@@ -929,7 +930,8 @@ async def _safety_release_recovers() -> None:
 
         # Phase 3: traffic resumes. A FULL_STATE saying KEY_A is held must
         # re-press it via the converge diff -- the recovery path.
-        wire.write_full_state(wstream, 0, [hid_a])
+        wstream.write(wire.encode_packet(
+            wire.PACKET_FULL_STATE, wire.encode_full_state(0, [hid_a])))
         await asyncio.sleep(0.1)
         assert hid_a in receiver.held_per_dev[0], (
             f"FULL_STATE did not re-press after safety release: "

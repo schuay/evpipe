@@ -4,19 +4,16 @@ All multi-byte fields are little-endian and fixed-width. The session
 opens with a magic + version + device-descriptor list; every subsequent
 packet is length-prefixed (u16) and discriminated by a 1-byte kind tag.
 
-Two surfaces are exposed:
-  * stream functions (``write_session_open``, ``write_event``, ...,
-    ``read_session_open``, ``read_packet``) -- used by the sender/receiver
-    against stdin/stdout.
-  * pure-bytes helpers (``encode_event``, ``decode_event``, ...) -- used
-    by the unit tests and by the sender to batch frames into a single
-    write where useful.
+The sender builds frames with the ``encode_*`` functions and writes the
+bytes itself. The receiver reads the stream with ``aread_session_open``
+and ``aread_packet``, then decodes each packet payload with ``decode_*``.
+Everything a malformed stream can trigger surfaces as ProtocolError.
 """
 from __future__ import annotations
 
+import asyncio
 import struct
 from dataclasses import dataclass, field
-from typing import BinaryIO
 
 MAGIC = b"EVPW"
 VERSION = 1
@@ -132,61 +129,11 @@ def encode_descriptor(d: DeviceDescriptor) -> bytes:
     return b"".join(parts)
 
 
-def decode_descriptor(data: bytes, off: int) -> tuple[DeviceDescriptor, int]:
-    (name_len,) = struct.unpack_from("<H", data, off)
-    off += 2
-    name = data[off : off + name_len].decode("utf-8")
-    off += name_len
-    vid, pid, kind = struct.unpack_from("<HHB", data, off)
-    off += 5
-    (nkeys,) = struct.unpack_from("<H", data, off)
-    off += 2
-    keys = list(struct.unpack_from(f"<{nkeys}H", data, off))
-    off += 2 * nkeys
-    (nrel,) = struct.unpack_from("<B", data, off)
-    off += 1
-    rel_axes = list(struct.unpack_from(f"<{nrel}B", data, off))
-    off += nrel
-    (nabs,) = struct.unpack_from("<B", data, off)
-    off += 1
-    abs_axes: list[AbsAxis] = []
-    for _ in range(nabs):
-        usage, mn, mx, res = struct.unpack_from("<Hiii", data, off)
-        off += 14
-        abs_axes.append(AbsAxis(usage, mn, mx, res))
-    return (
-        DeviceDescriptor(
-            name=name,
-            vendor_id=vid,
-            product_id=pid,
-            kind=kind,
-            keys=keys,
-            rel_axes=rel_axes,
-            abs_axes=abs_axes,
-        ),
-        off,
-    )
-
-
 def encode_session_open(devices: list[DeviceDescriptor]) -> bytes:
     parts = [MAGIC, struct.pack("<BBH", VERSION, 0, len(devices))]
     for d in devices:
         parts.append(encode_descriptor(d))
     return b"".join(parts)
-
-
-def decode_session_open(data: bytes) -> tuple[list[DeviceDescriptor], int]:
-    if len(data) < 8 or data[:4] != MAGIC:
-        raise ProtocolError(f"bad magic: {data[:4]!r}")
-    version, _, ndev = struct.unpack_from("<BBH", data, 4)
-    if version != VERSION:
-        raise ProtocolError(f"unsupported version: {version}")
-    off = 8
-    devices: list[DeviceDescriptor] = []
-    for _ in range(ndev):
-        d, off = decode_descriptor(data, off)
-        devices.append(d)
-    return devices, off
 
 
 def encode_packet(kind: int, payload: bytes) -> bytes:
@@ -196,89 +143,12 @@ def encode_packet(kind: int, payload: bytes) -> bytes:
     return struct.pack("<HB", body_len, kind) + payload
 
 
-# ---- stream readers/writers ----------------------------------------------
+# ---- stream readers --------------------------------------------------------
 
 
-def _read_exact(stream: BinaryIO, n: int) -> bytes:
-    buf = bytearray()
-    while len(buf) < n:
-        chunk = stream.read(n - len(buf))
-        if not chunk:
-            raise EOFError("short read")
-        buf.extend(chunk)
-    return bytes(buf)
-
-
-def write_session_open(stream: BinaryIO, devices: list[DeviceDescriptor]) -> None:
-    stream.write(encode_session_open(devices))
-    stream.flush()
-
-
-def read_session_open(stream: BinaryIO) -> list[DeviceDescriptor]:
-    head = _read_exact(stream, 8)
-    if head[:4] != MAGIC:
-        raise ProtocolError(f"bad magic: {head[:4]!r}")
-    version, _, ndev = struct.unpack_from("<BBH", head, 4)
-    if version != VERSION:
-        raise ProtocolError(f"unsupported version: {version}")
-    devices: list[DeviceDescriptor] = []
-    for _ in range(ndev):
-        devices.append(_read_descriptor_stream(stream))
-    return devices
-
-
-def _read_descriptor_stream(stream: BinaryIO) -> DeviceDescriptor:
-    (name_len,) = struct.unpack("<H", _read_exact(stream, 2))
-    name = _read_exact(stream, name_len).decode("utf-8")
-    vid, pid, kind = struct.unpack("<HHB", _read_exact(stream, 5))
-    (nkeys,) = struct.unpack("<H", _read_exact(stream, 2))
-    keys = list(struct.unpack(f"<{nkeys}H", _read_exact(stream, 2 * nkeys))) if nkeys else []
-    (nrel,) = struct.unpack("<B", _read_exact(stream, 1))
-    rel_axes = list(struct.unpack(f"<{nrel}B", _read_exact(stream, nrel))) if nrel else []
-    (nabs,) = struct.unpack("<B", _read_exact(stream, 1))
-    abs_axes: list[AbsAxis] = []
-    for _ in range(nabs):
-        usage, mn, mx, res = struct.unpack("<Hiii", _read_exact(stream, 14))
-        abs_axes.append(AbsAxis(usage, mn, mx, res))
-    return DeviceDescriptor(
-        name=name,
-        vendor_id=vid,
-        product_id=pid,
-        kind=kind,
-        keys=keys,
-        rel_axes=rel_axes,
-        abs_axes=abs_axes,
-    )
-
-
-def write_event(stream: BinaryIO, ev: Event) -> None:
-    stream.write(encode_packet(PACKET_EVENT, encode_event(ev)))
-
-
-def write_full_state(stream: BinaryIO, device_id: int, held: list[int]) -> None:
-    stream.write(encode_packet(PACKET_FULL_STATE, encode_full_state(device_id, held)))
-
-
-def write_heartbeat(stream: BinaryIO) -> None:
-    stream.write(encode_packet(PACKET_HEARTBEAT, b""))
-
-
-def read_packet(stream: BinaryIO) -> tuple[int, bytes]:
-    """Read one packet: returns (kind, payload). Raises EOFError at clean EOF."""
-    head = _read_exact(stream, 2)
-    (body_len,) = struct.unpack("<H", head)
-    if body_len < 1:
-        raise ProtocolError(f"zero-length packet body")
-    body = _read_exact(stream, body_len)
-    return body[0], body[1:]
-
-
-# ---- async stream readers (StreamReader-backed) --------------------------
-
-
-async def _aread_exact(reader, n: int) -> bytes:
-    import asyncio
-
+async def _aread_exact(reader: asyncio.StreamReader, n: int) -> bytes:
+    """Read exactly `n` bytes. EOFError at a clean end of stream,
+    ProtocolError if the stream ends inside the read."""
     try:
         return await reader.readexactly(n)
     except asyncio.IncompleteReadError as exc:
@@ -287,7 +157,7 @@ async def _aread_exact(reader, n: int) -> bytes:
         raise EOFError("clean EOF") from exc
 
 
-async def aread_session_open(reader) -> list[DeviceDescriptor]:
+async def aread_session_open(reader: asyncio.StreamReader) -> list[DeviceDescriptor]:
     head = await _aread_exact(reader, 8)
     if head[:4] != MAGIC:
         raise ProtocolError(f"bad magic: {head[:4]!r}")
@@ -300,9 +170,12 @@ async def aread_session_open(reader) -> list[DeviceDescriptor]:
     return devices
 
 
-async def _aread_descriptor(reader) -> DeviceDescriptor:
+async def _aread_descriptor(reader: asyncio.StreamReader) -> DeviceDescriptor:
     (name_len,) = struct.unpack("<H", await _aread_exact(reader, 2))
-    name = (await _aread_exact(reader, name_len)).decode("utf-8")
+    try:
+        name = (await _aread_exact(reader, name_len)).decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ProtocolError(f"device name is not UTF-8: {exc}") from exc
     vid, pid, kind = struct.unpack("<HHB", await _aread_exact(reader, 5))
     (nkeys,) = struct.unpack("<H", await _aread_exact(reader, 2))
     keys = (
@@ -330,7 +203,8 @@ async def _aread_descriptor(reader) -> DeviceDescriptor:
     )
 
 
-async def aread_packet(reader) -> tuple[int, bytes]:
+async def aread_packet(reader: asyncio.StreamReader) -> tuple[int, bytes]:
+    """Read one packet: (kind, payload). EOFError at a clean end of stream."""
     head = await _aread_exact(reader, 2)
     (body_len,) = struct.unpack("<H", head)
     if body_len < 1:

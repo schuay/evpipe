@@ -30,6 +30,29 @@ def async_test(fn):
     return wrapper
 
 
+def stream_reader(data: bytes) -> asyncio.StreamReader:
+    """A StreamReader holding `data` followed by EOF."""
+    reader = asyncio.StreamReader()
+    reader.feed_data(data)
+    reader.feed_eof()
+    return reader
+
+
+async def read_stream(
+    data: bytes,
+) -> tuple[list[wire.DeviceDescriptor], list[tuple[int, bytes]]]:
+    """Parse a complete sender byte stream the way the receiver does:
+    the session-open descriptors, then every (kind, payload) packet."""
+    reader = stream_reader(data)
+    devices = await wire.aread_session_open(reader)
+    packets: list[tuple[int, bytes]] = []
+    while True:
+        try:
+            packets.append(await wire.aread_packet(reader))
+        except EOFError:
+            return devices, packets
+
+
 class FakeInputDevice:
     """Scripted evdev.InputDevice.
 
@@ -190,18 +213,13 @@ class SenderHarness:
         for d in self.devs:
             await d.settle()
 
-    def packets(self) -> list[tuple]:
+    async def packets(self) -> list[tuple]:
         """Everything sent after session-open, decoded back to evdev codes:
         ("key", code, value), ("rel", code, value), ("syn",) or
         ("fs", device_id, [held codes])."""
-        buf = io.BytesIO(self.out.getvalue())
-        wire.read_session_open(buf)
         out: list[tuple] = []
-        while True:
-            try:
-                kind, payload = wire.read_packet(buf)
-            except EOFError:
-                return out
+        _, raw_packets = await read_stream(self.out.getvalue())
+        for kind, payload in raw_packets:
             if kind == wire.PACKET_FULL_STATE:
                 dev_id, held = wire.decode_full_state(payload)
                 out.append(("fs", dev_id, sorted(hid_map.decode_key(h) for h in held)))
@@ -213,9 +231,10 @@ class SenderHarness:
                 out.append(("rel", hid_map.decode_rel(ev.code), ev.value))
             elif ev.ev_kind == wire.EV_SYN:
                 out.append(("syn",))
+        return out
 
-    def key_events(self) -> list[tuple[int, int]]:
-        return [(p[1], p[2]) for p in self.packets() if p[0] == "key"]
+    async def key_events(self) -> list[tuple[int, int]]:
+        return [(p[1], p[2]) for p in await self.packets() if p[0] == "key"]
 
-    def full_states(self) -> list[list[int]]:
-        return [p[2] for p in self.packets() if p[0] == "fs"]
+    async def full_states(self) -> list[list[int]]:
+        return [p[2] for p in await self.packets() if p[0] == "fs"]
