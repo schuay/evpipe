@@ -225,3 +225,110 @@ async def test_local_only_key_matches_chords_but_never_reaches_the_wire(tmp_path
         assert marker.read_text() == "fired\n"
         assert h.key_events() == [(A, 1), (A, 0)]
         assert h.full_states() == [[]]
+
+
+@async_test
+async def test_lost_trigger_release_does_not_keep_the_grab():
+    """ON->OFF holds the grab until the trigger's key-up. If that event is
+    lost the wait must still end, or the keyboard stays grabbed with every
+    event, the chord included, swallowed."""
+    kb = _kb()
+    async with SenderHarness(kb, toggle_chord_evdev=[F10]) as h:
+        kb.press(F10)
+        await h.settle()
+        kb.lose_release(F10)
+        await h.app._resync()
+        # Up in the kernel on one tick only: the event may still be queued.
+        assert kb.grabbed
+        await h.app._resync()
+        assert not kb.grabbed
+
+        kb.tap(F10)
+        await h.settle()
+        assert h.app.forwarding_on is True
+        assert kb.grabbed
+        kb.tap(A)
+        await h.settle()
+        assert h.key_events() == [(A, 1), (A, 0)]
+
+
+@async_test
+async def test_lost_release_does_not_block_switching_on():
+    kb = _kb()
+    async with SenderHarness(kb, toggle_chord_evdev=[CTRL, F12],
+                             start_forwarding=False) as h:
+        kb.press(CTRL)
+        kb.tap(F12)
+        await h.settle()
+        kb.lose_release(CTRL)
+        await h.app._resync()
+        assert not kb.grabbed
+        await h.app._resync()
+        assert kb.grabbed
+        assert h.app.forwarding_on is True
+
+        # The lost modifier is not remembered as held: a bare F12 is a key.
+        kb.tap(F12)
+        await h.settle()
+        assert h.app.forwarding_on is True
+        assert h.key_events() == [(F12, 1), (F12, 0)]
+
+
+@async_test
+async def test_lost_release_needs_two_consecutive_ticks():
+    kb = _kb()
+    async with SenderHarness(kb, toggle_chord_evdev=[F12],
+                             start_forwarding=False) as h:
+        kb.press(BTN)
+        kb.tap(F12)
+        await h.settle()
+        kb.lose_release(BTN)
+        await h.app._resync()   # up
+        kb.press(BTN)
+        await h.settle()
+        await h.app._resync()   # down again
+        kb.lose_release(BTN)
+        await h.app._resync()   # up, but not twice in a row
+        assert not kb.grabbed
+        await h.app._resync()
+        assert kb.grabbed
+
+
+@async_test
+async def test_action_trigger_released_during_a_toggle_fires_again(tmp_path):
+    marker = tmp_path / "fired"
+    kb = _kb()
+    async with SenderHarness(
+        kb, toggle_chord_evdev=[F10],
+        action_chords=[([F9], f"echo fired >> {marker}")],
+    ) as h:
+        kb.press(F9)
+        kb.press(F10)   # ON->OFF while the action trigger is still down
+        kb.release(F9)
+        kb.release(F10)
+        kb.tap(F10)     # back ON
+        kb.tap(F9)
+        await h.settle()
+        await asyncio.gather(*h.app._background_tasks)
+        assert marker.read_text() == "fired\nfired\n"
+        assert h.key_events() == []
+
+
+@async_test
+async def test_each_deferred_toggle_judges_lost_releases_afresh():
+    kb = _kb()
+    async with SenderHarness(kb, toggle_chord_evdev=[F10]) as h:
+        kb.press(F10)
+        await h.settle()
+        kb.release(F10)         # up in the kernel, event still queued
+        await h.app._resync()
+        await h.settle()        # delivered after all: OFF, ungrabbed
+        assert not kb.grabbed
+
+        kb.press(F10)
+        await h.settle()
+        kb.lose_release(F10)
+        await h.app._resync()
+        assert not kb.grabbed, "one tick must not be enough"
+        await h.app._resync()
+        assert kb.grabbed

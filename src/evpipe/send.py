@@ -224,6 +224,9 @@ class SenderApp:
         # True -> grab on completion (OFF->ON), False -> ungrab (ON->OFF).
         self._pending_release: set[int] = set()
         self._pending_grab = False
+        # Awaited keys the kernel already reported up at the last resync
+        # tick; see _expire_lost_releases.
+        self._release_overdue: set[int] = set()
 
     def shutdown(self) -> None:
         self.shutting_down.set()
@@ -494,6 +497,7 @@ class SenderApp:
                     src.held_evdev.add(event.code)
                 elif event.value == 0:
                     src.held_evdev.discard(event.code)
+                    src.swallow_release.discard(event.code)
                     self._pending_release.discard(event.code)
                     if not self._pending_release:
                         await self._complete_deferred_toggle()
@@ -597,12 +601,7 @@ class SenderApp:
                 # seed/emit at completion cannot leak anything onto A either.
                 # Cost: holding the chord (or a drag) delays the grab until you
                 # let go, but B stays usable locally in the meantime.
-                pending: set[int] = set()
-                for src in self.sources:
-                    try:
-                        pending |= set(src.dev.active_keys())
-                    except OSError:
-                        pass
+                pending = self._active_keys()
                 pending.add(self.toggle_trigger_evdev)
                 self._begin_deferred_toggle(grab_on_complete=True, pending=pending)
                 logger.info("forwarding ON (waiting for held keys to release to grab)")
@@ -619,6 +618,43 @@ class SenderApp:
         """
         self._pending_grab = grab_on_complete
         self._pending_release = set(pending)
+        self._release_overdue = set()
+
+    def _active_keys(self) -> set[int]:
+        """Every key and button the kernel reports down, across all sources."""
+        active: set[int] = set()
+        for src in self.sources:
+            try:
+                active |= set(src.dev.active_keys())
+            except OSError:
+                pass
+        return active
+
+    async def _expire_lost_releases(self) -> None:
+        """Stop waiting for key-ups that are not going to arrive.
+
+        A deferred toggle completes on the release events of the keys in
+        `_pending_release`, and until then every event is swallowed, the
+        toggle chord included. An event the kernel dropped (SYN_DROPPED)
+        would make that permanent, on ON->OFF with the devices still
+        grabbed. The kernel's key state is the way out: a key it reports up
+        on two consecutive resync ticks has no release left in our queue.
+        One tick is not enough, the event may just not have been read yet.
+        """
+        if not self._pending_release:
+            return
+        up = self._pending_release - self._active_keys()
+        lost = up & self._release_overdue
+        self._release_overdue = up - lost
+        if not lost:
+            return
+        logger.warning("release of %s never arrived; no longer waiting for it",
+                       sorted(lost))
+        for src in self.sources:
+            src.held_evdev -= lost
+        self._pending_release -= lost
+        if not self._pending_release:
+            await self._complete_deferred_toggle()
 
     async def _complete_deferred_toggle(self) -> None:
         """Cross the grab boundary now that the awaited chord keys have released.
@@ -792,6 +828,7 @@ class SenderApp:
             await self._resync()
 
     async def _resync(self) -> None:
+        await self._expire_lost_releases()
         for src in self.sources:
             await self._emit_full_state(src)
 
