@@ -85,6 +85,11 @@ ssh user@B '
 `--start-off` is useful when you want B's keyboard to start out
 local-only and flip into forwarding mode only after you press the chord.
 
+Forwarding never begins in the middle of a keystroke. At startup, and
+when toggling ON, the sender waits until every key and button on the
+source devices is released before it grabs them, so nothing is left
+stuck down on B or pressed out of nowhere on A.
+
 ## Action hotkeys while grabbed
 
 Once forwarding is ON the sender holds `EVIOCGRAB`, so B's compositor

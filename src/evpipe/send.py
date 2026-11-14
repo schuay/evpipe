@@ -241,7 +241,16 @@ class SenderApp:
             self._teardown()
             return
         if self.forwarding_on:
-            if self._grab_all():
+            held = self._active_keys()
+            if held:
+                # The same boundary as OFF->ON in _toggle: B's compositor has
+                # seen these keys go down, so it must see them come up, and
+                # the first resync must not press them on the receiver.
+                self.forwarding_on = False
+                self._begin_deferred_toggle(grab_on_complete=True, pending=held)
+                logger.info("forwarding ON at startup (waiting for held keys "
+                            "to release to grab)")
+            elif self._grab_all():
                 logger.info("forwarding ON at startup")
 
         tasks: list[asyncio.Task] = []
@@ -673,7 +682,7 @@ class SenderApp:
                 self._seed_held_from_kernel(src)
                 await self._emit_full_state(src)
             if grabbed:
-                logger.debug("chord released; grabbed, forwarding ON")
+                logger.debug("held keys released; grabbed, forwarding ON")
         else:
             self._ungrab_all()
             logger.debug("trigger released; ungrabbed")

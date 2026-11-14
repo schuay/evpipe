@@ -332,3 +332,36 @@ async def test_each_deferred_toggle_judges_lost_releases_afresh():
         assert not kb.grabbed, "one tick must not be enough"
         await h.app._resync()
         assert kb.grabbed
+
+
+@async_test
+async def test_startup_defers_grab_while_a_key_is_held():
+    """Starting ON is an OFF->ON flip: a key that is down belongs to the
+    local compositor until it is released, and must not be pressed on the
+    receiver by the first resync."""
+    kb = _kb(held=[ENTER])
+    async with SenderHarness(kb) as h:
+        assert not kb.grabbed
+        await h.app._resync()
+        kb.release(ENTER)
+        await h.settle()
+        assert kb.grabbed
+        assert h.app.forwarding_on is True
+        assert kb.seen_by_others == [(ENTER, 0)]
+        kb.tap(A)
+        await h.settle()
+        assert h.key_events() == [(A, 1), (A, 0)]
+        assert all(held == [] for held in h.full_states())
+
+
+@async_test
+async def test_start_off_does_not_grab():
+    kb = _kb(held=[ENTER])
+    async with SenderHarness(kb, toggle_chord_evdev=[F10],
+                             start_forwarding=False) as h:
+        kb.release(ENTER)
+        kb.tap(A)
+        await h.settle()
+        assert not kb.grabbed
+        assert h.app.forwarding_on is False
+        assert h.key_events() == []
