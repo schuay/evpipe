@@ -1,5 +1,5 @@
-"""Tests for the sender's self-termination on host suspend and for honest
-grab reporting. No real devices: sources are stand-ins."""
+"""Tests for the sender's exit paths (host suspend, a crashed task) and for
+honest grab reporting. No real devices: sources are stand-ins."""
 from __future__ import annotations
 
 import asyncio
@@ -7,10 +7,13 @@ import errno
 import io
 import logging
 
+import evdev.ecodes as e
 import pytest
 
 from evpipe import wire
 from evpipe.send import SenderApp, SuspendDetector
+
+from .fakes import FakeInputDevice, SenderHarness, async_test
 
 
 class _Clocks:
@@ -109,3 +112,32 @@ def test_grab_all_succeeds_quietly(caplog):
     with caplog.at_level(logging.WARNING, logger="evpipe-send"):
         assert app._grab_all() is True
     assert caplog.text == ""
+
+
+@async_test
+async def test_reader_crash_ends_the_session_and_releases_the_grab():
+    kb = FakeInputDevice(keys=[e.KEY_A])
+    h = SenderHarness(kb)
+    await h.start()
+    assert kb.grabbed
+    kb.fail(RuntimeError("reader broke"))
+    with pytest.raises(RuntimeError, match="reader broke"):
+        await h.task
+    assert not kb.grabbed
+    assert kb.closed
+
+
+@async_test
+async def test_resync_crash_ends_the_session_and_releases_the_grab():
+    kb = FakeInputDevice(keys=[e.KEY_A])
+    h = SenderHarness(kb, resync_interval_s=0.01)
+    await h.start()
+
+    def broken() -> list[int]:
+        raise RuntimeError("resync broke")
+
+    kb.active_keys = broken
+    with pytest.raises(RuntimeError, match="resync broke"):
+        await h.task
+    assert not kb.grabbed
+    assert kb.closed

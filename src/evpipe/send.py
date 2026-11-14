@@ -247,6 +247,7 @@ class SenderApp:
             tasks.append(asyncio.create_task(self._read_source(src),
                                              name=f"src:{src.path}"))
         tasks.append(asyncio.create_task(self._resync_loop(), name="resync"))
+        tasks.append(asyncio.create_task(self.shutting_down.wait(), name="shutdown"))
 
         server = None
         try:
@@ -254,15 +255,16 @@ class SenderApp:
             # by now the sources may be grabbed, and the teardown contract
             # requires ungrabbing on every exit path.
             server = await self._start_dictation_server()
-            await self.shutting_down.wait()
+            # Any task ending ends the session. A reader or the resync dying
+            # on an unexpected exception must not leave the devices grabbed
+            # with nobody reading them: the toggle chord would be dead too.
+            done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+            for t in done:
+                t.result()
         finally:
             for t in tasks:
                 t.cancel()
-            for t in tasks:
-                try:
-                    await t
-                except (asyncio.CancelledError, Exception):
-                    pass
+            await asyncio.gather(*tasks, return_exceptions=True)
             if server is not None:
                 server.close()
                 try:
