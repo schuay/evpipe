@@ -39,5 +39,6 @@ EVPIPE_SEND_ARGS=--kb /dev/input/by-id/usb-Keyboard-event-kbd --mouse /dev/input
 EVPIPE_RECV_CMD=evpipe-recv
 EVPIPE_RECV_ARGS=
 
-# Both ends log to the journal via stderr; --log-level=DEBUG on either
-# side shows chord matching and dropped events.
+# Both ends log to the journal via stderr. --log-level=DEBUG in
+# EVPIPE_SEND_ARGS shows chord matching and keys dropped for lack of a
+# mapping.

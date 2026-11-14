@@ -135,8 +135,8 @@ path (accented letters/emoji have no HID key and are dropped).
   task).
 * REL_X, REL_Y, REL_WHEEL, REL_HWHEEL (incl. hi-res variants).
 
-Anything outside the static `hid_map` table is dropped at the sender
-with a debug log line. EV_ABS (tablets, touchscreens) is reserved in
+Anything outside the static `hid_map` table is dropped at the sender;
+`--log-level=DEBUG` there logs each dropped key press. EV_ABS (tablets, touchscreens) is reserved in
 the wire format but not yet wired in either direction.
 
 ## Running it as a service

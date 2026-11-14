@@ -541,6 +541,9 @@ class SenderApp:
                 src.held_evdev.discard(event.code)
             u = hid_map.encode_key(event.code)
             if u is None:
+                if src.grabbed and event.value == 1:
+                    logger.debug("key %d has no HID mapping; not forwarded",
+                                 event.code)
                 return
             # Local-only key: recorded in held_evdev above (so chords still
             # match on it) but never forwarded and never added to the resync

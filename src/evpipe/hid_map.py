@@ -12,7 +12,7 @@ Both halves of every table are checked in: regenerating from libevdev at
 install time would couple us to host headers and isn't worth the build-time
 dep. The static set covers every code a stock 104/105 kb, mouse, or
 consumer-control keyboard emits in normal use; codes outside it are
-dropped at the sender with a warning.
+dropped at the sender, key presses with a debug log line.
 """
 from __future__ import annotations
 

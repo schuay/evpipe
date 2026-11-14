@@ -3,6 +3,7 @@ through fake input devices and asserted on the wire output."""
 from __future__ import annotations
 
 import asyncio
+import logging
 
 import evdev.ecodes as e
 
@@ -48,13 +49,16 @@ async def test_relative_motion_is_forwarded():
 
 
 @async_test
-async def test_unmapped_key_is_dropped():
+async def test_unmapped_key_is_dropped_and_logged_at_debug(caplog):
     kb = FakeInputDevice(keys=[A, e.KEY_FN])
     async with SenderHarness(kb) as h:
-        kb.tap(e.KEY_FN)
-        kb.tap(A)
-        await h.settle()
+        with caplog.at_level(logging.DEBUG, logger="evpipe-send"):
+            kb.tap(e.KEY_FN)
+            kb.tap(A)
+            await h.settle()
         assert await h.key_events() == [(A, 1), (A, 0)]
+        dropped = [r.getMessage() for r in caplog.records if "no HID mapping" in r.getMessage()]
+        assert dropped == [f"key {e.KEY_FN} has no HID mapping; not forwarded"]
 
 
 @async_test
